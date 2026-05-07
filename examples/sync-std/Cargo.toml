@@ -1,0 +1,15 @@
+[package]
+name = "sync-std"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bareminal_cli = { path = "../../bareminal-cli", default-features = false, features = [
+  "std",
+] }
+bareminal_macros = { path = "../../bareminal-macros" }
+termios = "0.3.3"
+anyhow = { version = "1.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde-json-core = "0.6.0"
+rand = "0.10.1"

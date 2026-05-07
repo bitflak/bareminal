@@ -1,0 +1,30 @@
+[package]
+name = "bareminal_macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = """
+Macros for Bareminal command line interface
+"""
+readme = "../README.md"
+keywords = ["no_std", "cli", "embedded"]
+categories = ["command-line-interface", "embedded", "no-std"]
+
+[lib]
+proc-macro = true
+
+[[test]]
+name = "tests"
+path = "tests/tests.rs"
+
+[dev-dependencies]
+trybuild = { version = "1.0.108", features = ["diff"] }
+
+[dependencies]
+bareminal_cli.workspace = true
+heapless.workspace = true
+heck = "0.5.0"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full", "visit-mut"] }

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["./bareminal-cli", "./bareminal-macros"]
+exclude = [
+  "./examples/sync-std",
+  "./examples/async-std",
+  "./examples/async-no-std/",
+]
+
+[workspace.package]
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+repository = "https://github.com/bitflak/bareminal.git"
+authors = ["Valeri Kremer"]
+
+[workspace.dependencies]
+bareminal_cli = { version = "0.1.0", path = "bareminal-cli", default-features = false, features = [
+  "std",
+] }
+heapless = "0.9.3"

@@ -1,0 +1,9 @@
+
+[default.general]
+chip = "STM32H755ZITx"
+
+[default.rtt]
+enabled = true
+
+[default.gdb]
+enabled = false

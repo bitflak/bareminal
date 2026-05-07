@@ -1,0 +1,38 @@
+[package]
+name = "bareminal_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors = ["Valeri Kremer"]
+description = """
+Async command line interface for bare-metal and std
+"""
+readme = "../README.md"
+keywords = ["no_std", "cli", "embedded"]
+categories = ["command-line-interface", "embedded", "no-std"]
+
+[dependencies]
+heapless = { workspace = true, features = ["serde"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = "0.6.0"
+tokio = { version = "1", features = ["io-std", "io-util"], optional = true }
+embedded-io-async = { version = "0.7.0", optional = true }
+embassy-futures = { version = "0.1.2", optional = true }
+defmt = { version = "1.0.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+] }
+
+
+[features]
+default = ["async-std"]
+std = ["alloc"]
+alloc = []
+async-no-std = ["embedded-io-async", "embassy-futures", "defmt"]
+async-std = ["tokio"]

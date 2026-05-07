@@ -1,0 +1,5 @@
+{
+  "rust-analyzer.cargo.features": ["async-std"],
+  "rust-analyzer.check.features": ["async-std"],
+  "rust-analyzer.check.command": "clippy"
+}
