@@ -485,8 +485,8 @@ where
         self.writer.flush().await
     }
 
-    pub async fn writer(&mut self) -> &mut CommandWriter<W> {
-        &mut self.writer
+    pub async fn writer(&mut self) -> &mut W {
+        &mut self.writer.writer
     }
 }
 

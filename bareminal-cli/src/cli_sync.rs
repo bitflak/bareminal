@@ -330,8 +330,8 @@ where
         self.writer.flush_write(buf)
     }
 
-    pub async fn writer(&mut self) -> &mut CommandWriter<W> {
-        &mut self.writer
+    pub fn writer(&mut self) -> &mut W {
+        &mut self.writer.writer
     }
 }
 
