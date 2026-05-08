@@ -354,7 +354,7 @@ where
                             self.redraw_prompt().await?;
                             self.writer.flush().await?;
                         }
-                        Control::Formfeed => {
+                        Control::Nak => {
                             self.cmdline.reset();
                             self.writer.flush_write(CRCLPROMPT).await?;
                         }
@@ -625,7 +625,6 @@ mod tests {
         for byte in b"hello" {
             cli.add_byte(*byte).await.unwrap();
         }
-        // Enter is 0x0d (CR) — adjust for whatever your InputParser expects.
         let pending = cli.add_byte(b'\r').await.unwrap();
         assert!(pending, "Enter should signal pending");
     }

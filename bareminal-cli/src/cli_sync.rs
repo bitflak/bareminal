@@ -291,7 +291,7 @@ where
                             self.cmdline.next_cmdline();
                             self.redraw_prompt()?;
                         }
-                        Control::Formfeed => {
+                        Control::Nak => {
                             self.cmdline.reset();
                             self.writer.write(CRCLPROMPT)?;
                         }

@@ -15,7 +15,7 @@ pub enum Control {
     Right,
     Tab,
     Up,
-    Formfeed,
+    Nak,
     Exit,
 }
 
@@ -58,7 +58,7 @@ impl InputParser {
             let input = match byte {
                 codes::BACKSPACE | codes::DEL => Control::Backspace,
                 codes::EXIT => Control::Exit,
-                codes::FORM_FEED => Control::Formfeed,
+                codes::NAK => Control::Nak,
                 codes::CARRIAGE_RETURN if prev_byte != codes::LINE_FEED => Control::Enter,
                 codes::LINE_FEED if prev_byte != codes::CARRIAGE_RETURN => Control::Enter,
                 codes::TAB => Control::Tab,
@@ -89,7 +89,7 @@ mod tests {
         Right,
         Tab,
         Up,
-        Formfeed,
+        Nak,
         Exit,
     }
 
@@ -102,7 +102,7 @@ mod tests {
             Control::Right => ControlKind::Right,
             Control::Tab => ControlKind::Tab,
             Control::Up => ControlKind::Up,
-            Control::Formfeed => ControlKind::Formfeed,
+            Control::Nak => ControlKind::Nak,
             Control::Exit => ControlKind::Exit,
         }
     }
@@ -146,17 +146,13 @@ mod tests {
     }
 
     #[test]
-    fn formfeed_emits_formfeed() {
+    fn formfeed_emits_nak() {
         let mut p = InputParser::new();
-        assert_eq!(
-            feed(&mut p, &[0x0C]),
-            vec![Owned::Ctrl(ControlKind::Formfeed)]
-        );
+        assert_eq!(feed(&mut p, &[0x15]), vec![Owned::Ctrl(ControlKind::Nak)]);
     }
 
     #[test]
     fn exit_byte_emits_exit() {
-        // Assumes codes::EXIT == 0x03; change if different.
         let mut p = InputParser::new();
         assert_eq!(feed(&mut p, &[0x03]), vec![Owned::Ctrl(ControlKind::Exit)]);
     }

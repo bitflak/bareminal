@@ -7,7 +7,7 @@ Dual-licensed under [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
 ## Features
 
 - [x] Command declaration with enums
-- [x] Clear line support (ctrl+l)
+- [x] Clear line support (ctrl+u)
 - [x] Command autocompletion (tab)
 - [x] Configurable memory usage
 - [x] Command editing (left/right arrows)
@@ -469,8 +469,6 @@ int -- char b -- simple
 ```
 
 ## Credits
-
-The proc macro, some unit tests, and parts of the documentation were assistance by Claude Chat.
 
 - [embedded-cli](https://github.com/funbiscuit/embedded-cli-rs)
 - [ANSI Escape Sequences](https://gist.github.com/ConnerWill/d4b6c776b509add763e17f9f113fd25b)
