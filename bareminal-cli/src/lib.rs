@@ -347,10 +347,14 @@ pub mod tokens;
 pub mod utf;
 
 #[cfg(any(feature = "async-no-std", feature = "async-std"))]
-mod cli_async;
+pub mod cli_async;
 
-#[cfg(feature = "std")]
-mod cli_sync;
+#[cfg(all(
+    feature = "std",
+    not(feature = "async-no-std"),
+    not(feature = "async-std")
+))]
+pub mod cli_sync;
 
 pub mod cli {
     #[allow(unused_imports)]
@@ -362,6 +366,10 @@ pub mod cli {
     ))]
     pub use cli_async::*;
 
-    #[cfg(feature = "std")]
+    #[cfg(all(
+        feature = "std",
+        not(feature = "async-no-std"),
+        not(feature = "async-std")
+    ))]
     pub use cli_sync::*;
 }
