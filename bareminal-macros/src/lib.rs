@@ -1,8 +1,8 @@
 use heck::ToKebabCase;
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use std::collections::HashMap;
+use syn::visit::{self as visit_ref, Visit};
 use syn::visit_mut::{self, VisitMut};
 use syn::{
     Attribute, Data, DeriveInput, Expr, Fields, GenericArgument, Lifetime, Meta, PathArguments,
@@ -50,7 +50,23 @@ fn unwrap_tuple(ty: &Type) -> Option<&Punctuated<Type, Token![,]>> {
     (!elems.is_empty()).then_some(elems)
 }
 
-// ── Lifetime rewriter ─────────────────────────────────────────────────────
+// ── Lifetime rewriter (with no-op fast path) ──────────────────────────────
+
+// True if the type contains any non-`'static` lifetime that would be touched
+// by the rewriter. Skip the deep clone for plain types like `u32`.
+fn type_has_rewritable_lifetime(ty: &Type) -> bool {
+    struct Probe(bool);
+    impl<'ast> Visit<'ast> for Probe {
+        fn visit_lifetime(&mut self, lt: &'ast Lifetime) {
+            if lt.ident != "static" {
+                self.0 = true;
+            }
+        }
+    }
+    let mut p = Probe(false);
+    visit_ref::Visit::visit_type(&mut p, ty);
+    p.0
+}
 
 struct LifetimeRewriter {
     target: Lifetime,
@@ -66,6 +82,9 @@ impl VisitMut for LifetimeRewriter {
 }
 
 fn rewrite_lifetimes(ty: &Type, target: &str) -> Type {
+    if !type_has_rewritable_lifetime(ty) {
+        return ty.clone();
+    }
     let mut ty = ty.clone();
     LifetimeRewriter {
         target: Lifetime::new(target, Span::call_site()),
@@ -209,15 +228,37 @@ fn array_is_all_str_literals(expr: &Expr) -> bool {
     }
 }
 
+// ── TypeCtx: cached per-type derived data ─────────────────────────────────
+
+// Caches the expensive-to-compute derivatives of a `&Type`:
+//   - `ty_par`: lifetime-rewritten clone (skipped if no lifetimes present)
+//   - `type_str`: `quote!(#ty).to_string()` (one full AST walk + alloc)
+struct TypeCtx<'a> {
+    ty: &'a Type,
+    ty_par: Type,
+    type_str: String,
+}
+
+impl<'a> TypeCtx<'a> {
+    fn new(ty: &'a Type) -> Self {
+        Self {
+            ty,
+            ty_par: rewrite_lifetimes(ty, "'par"),
+            type_str: quote!(#ty).to_string(),
+        }
+    }
+}
+
+// ── Default value expression generation ──────────────────────────────────
+
 /// Emit a `match FromStr::from_str(__default_str) { ... }` block, optionally
 /// wrapping the success value in `Some(...)`.
 fn from_str_default_block(
-    parse_ty: &Type,
+    parse_ty_par: &Type,
     s_value: &str,
     type_str: &str,
     wrap_some: bool,
-) -> proc_macro2::TokenStream {
-    let parse_ty_par = rewrite_lifetimes(parse_ty, "'par");
+) -> TokenStream2 {
     let ok_arm = if wrap_some {
         quote! { ::core::option::Option::Some(parsed) }
     } else {
@@ -240,8 +281,8 @@ fn from_str_default_block(
     }
 }
 
-fn default_value_expr(expr: &Expr, target_ty: &Type) -> proc_macro2::TokenStream {
-    let target_ty_par = rewrite_lifetimes(target_ty, "'par");
+fn default_value_expr(expr: &Expr, target: &TypeCtx) -> TokenStream2 {
+    let target_ty_par = &target.ty_par;
 
     let Some(s_value) = string_lit(expr) else {
         // Non-string-literal default: splice the typed expression directly.
@@ -253,7 +294,7 @@ fn default_value_expr(expr: &Expr, target_ty: &Type) -> proc_macro2::TokenStream
         };
     };
 
-    let inner = match (is_str_slice(target_ty), unwrap_option(target_ty)) {
+    let inner = match (is_str_slice(target.ty), unwrap_option(target.ty)) {
         // Case 1: target is &str — splice the literal directly.
         (true, _) => quote! { #s_value },
 
@@ -264,15 +305,12 @@ fn default_value_expr(expr: &Expr, target_ty: &Type) -> proc_macro2::TokenStream
 
         // Case 2b: Option<T> for other T — parse via FromStr, wrap in Some.
         (_, Some(inner)) => {
-            let type_str = quote!(#inner).to_string();
-            from_str_default_block(inner, &s_value, &type_str, true)
+            let inner_ctx = TypeCtx::new(inner);
+            from_str_default_block(&inner_ctx.ty_par, &s_value, &inner_ctx.type_str, true)
         }
 
         // Case 3: any other type — parse via FromStr.
-        _ => {
-            let type_str = quote!(#target_ty).to_string();
-            from_str_default_block(target_ty, &s_value, &type_str, false)
-        }
+        _ => from_str_default_block(target_ty_par, &s_value, &target.type_str, false),
     };
 
     quote! {
@@ -287,15 +325,15 @@ fn range_check(
     var: &syn::Ident,
     min: Option<&Expr>,
     max: Option<&Expr>,
-    target_ty: &Type,
+    target: &TypeCtx,
     context_str: &str,
-) -> proc_macro2::TokenStream {
+) -> TokenStream2 {
     if min.is_none() && max.is_none() {
-        return quote! {};
+        return TokenStream2::new();
     }
 
-    let target_ty_par = rewrite_lifetimes(target_ty, "'par");
-    let type_str = quote!(#target_ty).to_string();
+    let target_ty_par = &target.ty_par;
+    let type_str = &target.type_str;
 
     let min_str = min.map(pretty_expr).unwrap_or_else(|| "none".to_string());
     let max_str = max.map(pretty_expr).unwrap_or_else(|| "none".to_string());
@@ -341,15 +379,15 @@ fn range_check(
 fn one_of_checks(
     parsed_var: &syn::Ident,
     one_of: Option<&(Expr, Vec<String>)>,
-    target_ty: &Type,
+    target: &TypeCtx,
     context_str: &str,
-) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+) -> (TokenStream2, TokenStream2) {
     let Some((array_expr, elem_strs)) = one_of else {
-        return (quote! {}, quote! {});
+        return (TokenStream2::new(), TokenStream2::new());
     };
 
     let array_expr = unwrap_groups(array_expr);
-    let type_str = quote!(#target_ty).to_string();
+    let type_str = &target.type_str;
 
     if array_is_all_str_literals(array_expr) {
         let pre = quote! {
@@ -365,9 +403,9 @@ fn one_of_checks(
                 }
             }
         };
-        (pre, quote! {})
+        (pre, TokenStream2::new())
     } else {
-        let target_ty_par = rewrite_lifetimes(target_ty, "'par");
+        let target_ty_par = &target.ty_par;
         let post = quote! {
             {
                 let __allowed: &[#target_ty_par] = &#array_expr;
@@ -381,7 +419,7 @@ fn one_of_checks(
                 }
             }
         };
-        (quote! {}, post)
+        (TokenStream2::new(), post)
     }
 }
 
@@ -460,13 +498,30 @@ fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
             Some(s) => s,
             None => pretty_expr(unwrap_groups(inner)),
         };
-        lines.push(format!("{}[default: {}]", indent, display));
+        let mut s = String::with_capacity(indent.len() + 11 + display.len());
+        s.push_str(indent);
+        s.push_str("[default: ");
+        s.push_str(&display);
+        s.push(']');
+        lines.push(s);
     }
     if let Some(mn) = &set.min {
-        lines.push(format!("{}[min: {}]", indent, pretty_expr(mn)));
+        let pe = pretty_expr(mn);
+        let mut s = String::with_capacity(indent.len() + 7 + pe.len());
+        s.push_str(indent);
+        s.push_str("[min: ");
+        s.push_str(&pe);
+        s.push(']');
+        lines.push(s);
     }
     if let Some(mx) = &set.max {
-        lines.push(format!("{}[max: {}]", indent, pretty_expr(mx)));
+        let pe = pretty_expr(mx);
+        let mut s = String::with_capacity(indent.len() + 7 + pe.len());
+        s.push_str(indent);
+        s.push_str("[max: ");
+        s.push_str(&pe);
+        s.push(']');
+        lines.push(s);
     }
     if let Some((_, elem_strs)) = &set.one_of {
         lines.push(format!("{}[one of: {}]", indent, elem_strs.join(", ")));
@@ -479,14 +534,13 @@ fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
 const FLAG_COLUMN: usize = 22;
 const FLAG_INDENT: &str = "                      ";
 
-fn build_field_help_lines(field: &syn::Field) -> Vec<String> {
+/// Build help lines for a field, given its pre-parsed `SetAttrs`.
+fn build_field_help_lines(field: &syn::Field, set: &SetAttrs) -> Vec<String> {
     let mut lines = Vec::new();
 
     let field_ident = field.ident.as_ref().unwrap();
     let field_name = field_ident.to_string();
     let long_flag = format!("--{}", field_name.to_kebab_case());
-
-    let set = parse_set_attrs(&field.attrs).ok().unwrap_or_default();
 
     let optional = unwrap_option(&field.ty).is_some();
 
@@ -510,26 +564,32 @@ fn build_field_help_lines(field: &syn::Field) -> Vec<String> {
     };
 
     let doc = extract_doc(&field.attrs);
-    let first_doc = doc.first().cloned().unwrap_or_default();
+    let first_doc = doc.first().map(String::as_str).unwrap_or("");
 
-    lines.push(format!(
-        "  {}{}{}",
-        flag_label,
-        " ".repeat(label_padding),
-        first_doc
-    ));
+    let mut head = String::with_capacity(2 + flag_label.len() + label_padding + first_doc.len());
+    head.push_str("  ");
+    head.push_str(&flag_label);
+    for _ in 0..label_padding {
+        head.push(' ');
+    }
+    head.push_str(first_doc);
+    lines.push(head);
 
     for line in doc.iter().skip(1) {
-        lines.push(format!("{}{}", FLAG_INDENT, line));
+        let mut s = String::with_capacity(FLAG_INDENT.len() + line.len());
+        s.push_str(FLAG_INDENT);
+        s.push_str(line);
+        lines.push(s);
     }
 
     if optional && set.default.is_none() {
-        lines.push(format!("{}[optional]", FLAG_INDENT));
+        let mut s = String::with_capacity(FLAG_INDENT.len() + 10);
+        s.push_str(FLAG_INDENT);
+        s.push_str("[optional]");
+        lines.push(s);
     }
 
-    for line in render_attr_summary(&set, FLAG_INDENT) {
-        lines.push(line);
-    }
+    lines.extend(render_attr_summary(set, FLAG_INDENT));
 
     lines
 }
@@ -559,9 +619,7 @@ fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<String> 
 
     // Doc comment lines.
     let doc = extract_doc(&v.attrs);
-    for line in &doc {
-        lines.push(line.clone());
-    }
+    lines.extend(doc.iter().cloned());
 
     let set = parse_set_attrs(&v.attrs).ok().unwrap_or_default();
 
@@ -579,12 +637,10 @@ fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<String> 
             if optional && set.default.is_none() {
                 lines.push("  [optional]".to_string());
             }
-            for line in render_attr_summary(&set, "  ") {
-                lines.push(line);
-            }
+            lines.extend(render_attr_summary(&set, "  "));
         }
         Fields::Named(named) => {
-            let mut usage_parts = Vec::new();
+            let mut usage_parts = Vec::with_capacity(named.named.len());
             for field in &named.named {
                 let field_ident = field.ident.as_ref().unwrap();
                 let long = format!("--{}", field_ident.to_string().to_kebab_case());
@@ -608,16 +664,13 @@ fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<String> 
                 lines.push(format!("{} {}", variant_str, usage_parts.join(" ")));
             }
 
-            for line in render_attr_summary(&set, "  ") {
-                lines.push(line);
-            }
+            lines.extend(render_attr_summary(&set, "  "));
             if !named.named.is_empty() {
                 lines.push(String::new());
                 lines.push("Flags:".to_string());
                 for field in &named.named {
-                    for line in build_field_help_lines(field) {
-                        lines.push(line);
-                    }
+                    let field_set = parse_set_attrs(&field.attrs).ok().unwrap_or_default();
+                    lines.extend(build_field_help_lines(field, &field_set));
                 }
             }
         }
@@ -642,13 +695,16 @@ fn build_top_level_help_lines(
     let col = max_name + 4;
 
     for (name, doc) in variants {
-        let summary = doc.first().cloned().unwrap_or_default();
-        lines.push(format!(
-            "  {}{}{}",
-            name,
-            " ".repeat(col - name.len()),
-            summary
-        ));
+        let summary = doc.first().map(String::as_str).unwrap_or("");
+        let pad = col - name.len();
+        let mut s = String::with_capacity(2 + name.len() + pad + summary.len());
+        s.push_str("  ");
+        s.push_str(name);
+        for _ in 0..pad {
+            s.push(' ');
+        }
+        s.push_str(summary);
+        lines.push(s);
     }
 
     lines
@@ -656,11 +712,12 @@ fn build_top_level_help_lines(
 
 // ── Parse-expression generators ───────────────────────────────────────────
 
-fn parse_element_value_expr(ty: &Type, context_str: &str) -> proc_macro2::TokenStream {
-    if is_str_slice(ty) {
+fn parse_element_value_expr(target: &TypeCtx, context_str: &str) -> TokenStream2 {
+    if is_str_slice(target.ty) {
         quote! { Ok::<_, ::bareminal_cli::process::ProcessError<'_>>(value) }
     } else {
-        let type_str = quote!(#ty).to_string();
+        let ty = target.ty;
+        let type_str = &target.type_str;
         quote! {
             match <#ty as ::core::str::FromStr>::from_str(value) {
                 Ok(parsed) => Ok(parsed),
@@ -674,10 +731,7 @@ fn parse_element_value_expr(ty: &Type, context_str: &str) -> proc_macro2::TokenS
     }
 }
 
-fn parse_tuple_expr(
-    elems: &Punctuated<Type, Token![,]>,
-    context_str: &str,
-) -> proc_macro2::TokenStream {
+fn parse_tuple_expr(elems: &Punctuated<Type, Token![,]>, context_str: &str) -> TokenStream2 {
     let element_blocks: Vec<_> = elems
         .iter()
         .enumerate()
@@ -685,7 +739,8 @@ fn parse_tuple_expr(
             let elem_context = format!("{}.{}", context_str, i);
             let var = quote::format_ident!("__elem_{}", i);
             if let Some(inner) = unwrap_option(elem_ty) {
-                let inner_parse = parse_element_value_expr(inner, &elem_context);
+                let inner_ctx = TypeCtx::new(inner);
+                let inner_parse = parse_element_value_expr(&inner_ctx, &elem_context);
                 let binding_ty = rewrite_lifetimes(elem_ty, "'par");
                 quote! {
                     let #var: #binding_ty = match tokens.next() {
@@ -697,7 +752,8 @@ fn parse_tuple_expr(
                     };
                 }
             } else {
-                let parse = parse_element_value_expr(elem_ty, &elem_context);
+                let elem_ctx = TypeCtx::new(elem_ty);
+                let parse = parse_element_value_expr(&elem_ctx, &elem_context);
                 quote! {
                     let value = tokens.next()
                         .ok_or(::bareminal_cli::process::ProcessError::Empty)?;
@@ -723,13 +779,13 @@ fn parse_tuple_expr(
 }
 
 fn parse_expr_with_check(
-    ty: &Type,
+    target: &TypeCtx,
     context_str: &str,
-    pre_check: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    if let Some(elems) = unwrap_tuple(ty) {
+    pre_check: &TokenStream2,
+) -> TokenStream2 {
+    if let Some(elems) = unwrap_tuple(target.ty) {
         parse_tuple_expr(elems, context_str)
-    } else if is_str_slice(ty) {
+    } else if is_str_slice(target.ty) {
         quote! {
             (|| -> Result<_, ::bareminal_cli::process::ProcessError<'par>> {
                 let value = tokens.next()
@@ -739,7 +795,8 @@ fn parse_expr_with_check(
             })()
         }
     } else {
-        let type_str = quote!(#ty).to_string();
+        let ty = target.ty;
+        let type_str = &target.type_str;
         quote! {
             (|| -> Result<_, ::bareminal_cli::process::ProcessError<'par>> {
                 let value = tokens.next()
@@ -760,7 +817,7 @@ fn parse_expr_with_check(
 
 // Emit the `let no_payload = ...;` block used to detect whether a
 // single-field tuple variant has been given a payload token.
-fn no_payload_check() -> proc_macro2::TokenStream {
+fn no_payload_check() -> TokenStream2 {
     quote! {
         let no_payload = match tokens.peek() {
             None => true,
@@ -780,17 +837,21 @@ fn struct_variant_arm(
     variant_ident: &syn::Ident,
     variant_str: &str,
     fields: &syn::FieldsNamed,
-) -> proc_macro2::TokenStream {
-    let mut bindings = Vec::new();
-    let mut flag_arms = Vec::new();
-    let mut field_inits = Vec::new();
-    let mut errors = Vec::new();
-    let mut seen_short: HashMap<String, syn::Ident> = HashMap::new();
+) -> TokenStream2 {
+    let mut bindings = Vec::with_capacity(fields.named.len());
+    let mut flag_arms = Vec::with_capacity(fields.named.len());
+    let mut field_inits = Vec::with_capacity(fields.named.len());
+    let mut errors: Vec<syn::Error> = Vec::new();
+    // Linear-scan vec is faster than HashMap for small N.
+    let mut seen_short: Vec<(String, syn::Ident)> = Vec::new();
+
+    let parsed_ident = quote::format_ident!("parsed");
 
     for field in &fields.named {
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
-        let long_flag = format!("--{}", field_ident.to_string().to_kebab_case());
+        let field_name = field_ident.to_string();
+        let long_flag = format!("--{}", field_name.to_kebab_case());
         let context_str = format!("{}.{}", variant_str, field_ident);
 
         let set_attrs = match parse_set_attrs(&field.attrs) {
@@ -801,48 +862,45 @@ fn struct_variant_arm(
             }
         };
 
-        let short_flag = set_attrs.resolved_short(&field_ident.to_string());
+        let short_flag = set_attrs.resolved_short(&field_name);
 
-        let mut flag_patterns: Vec<proc_macro2::TokenStream> = vec![quote! { #long_flag }];
+        let mut flag_patterns: Vec<TokenStream2> = Vec::with_capacity(2);
+        flag_patterns.push(quote! { #long_flag });
         if let Some(short) = &short_flag {
-            if let Some(prev) = seen_short.get(short) {
+            if let Some((_, prev)) = seen_short.iter().find(|(k, _)| k == short) {
                 errors.push(syn::Error::new_spanned(
                     field,
                     format!("short flag `{}` is already used by field `{}`", short, prev),
                 ));
             } else {
-                seen_short.insert(short.clone(), field_ident.clone());
+                seen_short.push((short.clone(), field_ident.clone()));
                 flag_patterns.push(quote! { #short });
             }
         }
         let flag_pattern = quote! { #(#flag_patterns)|* };
 
-        let default = set_attrs.default;
-        let min = set_attrs.min;
-        let max = set_attrs.max;
-        let one_of = set_attrs.one_of;
-        let binding_ty = rewrite_lifetimes(field_ty, "'par");
+        let default = set_attrs.default.as_ref();
+        let min = set_attrs.min.as_ref();
+        let max = set_attrs.max.as_ref();
+        let one_of = set_attrs.one_of.as_ref();
+
+        // Cache the field-type context once.
+        let field_ctx = TypeCtx::new(field_ty);
+        let binding_ty = &field_ctx.ty_par;
 
         if let Some(inner) = unwrap_option(field_ty) {
             bindings.push(quote! {
                 let mut #field_ident: #binding_ty = None;
             });
 
+            // Inner-type context, cached.
+            let inner_ctx = TypeCtx::new(inner);
+
             if is_bool(inner) {
-                let parse = parse_element_value_expr(inner, &context_str);
-                let range = range_check(
-                    &quote::format_ident!("parsed"),
-                    min.as_ref(),
-                    max.as_ref(),
-                    inner,
-                    &context_str,
-                );
-                let (_pre, post_check) = one_of_checks(
-                    &quote::format_ident!("parsed"),
-                    one_of.as_ref(),
-                    inner,
-                    &context_str,
-                );
+                let parse = parse_element_value_expr(&inner_ctx, &context_str);
+                let range = range_check(&parsed_ident, min, max, &inner_ctx, &context_str);
+                let (_pre, post_check) =
+                    one_of_checks(&parsed_ident, one_of, &inner_ctx, &context_str);
                 flag_arms.push(quote! {
                     #flag_pattern => {
                         match tokens.peek() {
@@ -865,20 +923,10 @@ fn struct_variant_arm(
                     }
                 });
             } else {
-                let (pre_check, post_check) = one_of_checks(
-                    &quote::format_ident!("parsed"),
-                    one_of.as_ref(),
-                    inner,
-                    &context_str,
-                );
-                let parse = parse_expr_with_check(inner, &context_str, &pre_check);
-                let range = range_check(
-                    &quote::format_ident!("parsed"),
-                    min.as_ref(),
-                    max.as_ref(),
-                    inner,
-                    &context_str,
-                );
+                let (pre_check, post_check) =
+                    one_of_checks(&parsed_ident, one_of, &inner_ctx, &context_str);
+                let parse = parse_expr_with_check(&inner_ctx, &context_str, &pre_check);
+                let range = range_check(&parsed_ident, min, max, &inner_ctx, &context_str);
                 flag_arms.push(quote! {
                     #flag_pattern => {
                         match #parse {
@@ -893,8 +941,8 @@ fn struct_variant_arm(
                 });
             }
 
-            let final_expr = if let Some(default_expr) = &default {
-                let default_value = default_value_expr(default_expr, field_ty);
+            let final_expr = if let Some(default_expr) = default {
+                let default_value = default_value_expr(default_expr, &field_ctx);
                 quote! {
                     match #field_ident {
                         Some(_) => #field_ident,
@@ -910,20 +958,10 @@ fn struct_variant_arm(
                 let mut #field_ident: ::core::option::Option<#binding_ty> = None;
             });
 
-            let (pre_check, post_check) = one_of_checks(
-                &quote::format_ident!("parsed"),
-                one_of.as_ref(),
-                field_ty,
-                &context_str,
-            );
-            let parse = parse_expr_with_check(field_ty, &context_str, &pre_check);
-            let range = range_check(
-                &quote::format_ident!("parsed"),
-                min.as_ref(),
-                max.as_ref(),
-                field_ty,
-                &context_str,
-            );
+            let (pre_check, post_check) =
+                one_of_checks(&parsed_ident, one_of, &field_ctx, &context_str);
+            let parse = parse_expr_with_check(&field_ctx, &context_str, &pre_check);
+            let range = range_check(&parsed_ident, min, max, &field_ctx, &context_str);
             flag_arms.push(quote! {
                 #flag_pattern => {
                     match #parse {
@@ -937,8 +975,8 @@ fn struct_variant_arm(
                 }
             });
 
-            let final_expr = if let Some(default_expr) = &default {
-                let default_value = default_value_expr(default_expr, field_ty);
+            let final_expr = if let Some(default_expr) = default {
+                let default_value = default_value_expr(default_expr, &field_ctx);
                 quote! {
                     match #field_ident {
                         Some(v) => v,
@@ -1012,6 +1050,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     };
 
+    let parsed_ident = quote::format_ident!("parsed");
+
     let arms = data_enum.variants.iter().map(|v| {
         let variant_ident = &v.ident;
         let variant_str = variant_ident.to_string().to_kebab_case();
@@ -1026,29 +1066,22 @@ pub fn derive(input: TokenStream) -> TokenStream {
                     Ok(s) => s,
                     Err(e) => return e.to_compile_error(),
                 };
-                let variant_default = variant_set.default;
-                let min = variant_set.min;
-                let max = variant_set.max;
-                let one_of = variant_set.one_of;
+                let variant_default = variant_set.default.as_ref();
+                let min = variant_set.min.as_ref();
+                let max = variant_set.max.as_ref();
+                let one_of = variant_set.one_of.as_ref();
                 let no_payload = no_payload_check();
 
+                let outer_ctx = TypeCtx::new(ty);
+
                 if let Some(inner) = unwrap_option(ty) {
-                    let (pre_check, post_check) = one_of_checks(
-                        &quote::format_ident!("parsed"),
-                        one_of.as_ref(),
-                        inner,
-                        &variant_str,
-                    );
-                    let parse = parse_expr_with_check(inner, &variant_str, &pre_check);
-                    let range = range_check(
-                        &quote::format_ident!("parsed"),
-                        min.as_ref(),
-                        max.as_ref(),
-                        inner,
-                        &variant_str,
-                    );
-                    let empty_branch = if let Some(default_expr) = &variant_default {
-                        let default_value = default_value_expr(default_expr, ty);
+                    let inner_ctx = TypeCtx::new(inner);
+                    let (pre_check, post_check) =
+                        one_of_checks(&parsed_ident, one_of, &inner_ctx, &variant_str);
+                    let parse = parse_expr_with_check(&inner_ctx, &variant_str, &pre_check);
+                    let range = range_check(&parsed_ident, min, max, &inner_ctx, &variant_str);
+                    let empty_branch = if let Some(default_expr) = variant_default {
+                        let default_value = default_value_expr(default_expr, &outer_ctx);
                         quote! { Ok(Self::Match::#variant_ident(#default_value)) }
                     } else {
                         quote! { Ok(Self::Match::#variant_ident(None)) }
@@ -1071,22 +1104,12 @@ pub fn derive(input: TokenStream) -> TokenStream {
                         },
                     }
                 } else {
-                    let (pre_check, post_check) = one_of_checks(
-                        &quote::format_ident!("parsed"),
-                        one_of.as_ref(),
-                        ty,
-                        &variant_str,
-                    );
-                    let parse = parse_expr_with_check(ty, &variant_str, &pre_check);
-                    let range = range_check(
-                        &quote::format_ident!("parsed"),
-                        min.as_ref(),
-                        max.as_ref(),
-                        ty,
-                        &variant_str,
-                    );
-                    if let Some(default_expr) = &variant_default {
-                        let default_value = default_value_expr(default_expr, ty);
+                    let (pre_check, post_check) =
+                        one_of_checks(&parsed_ident, one_of, &outer_ctx, &variant_str);
+                    let parse = parse_expr_with_check(&outer_ctx, &variant_str, &pre_check);
+                    let range = range_check(&parsed_ident, min, max, &outer_ctx, &variant_str);
+                    if let Some(default_expr) = variant_default {
+                        let default_value = default_value_expr(default_expr, &outer_ctx);
                         quote! {
                             #variant_str => {
                                 #no_payload
@@ -1149,7 +1172,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         .collect();
     let top_level_lines = build_top_level_help_lines(&general_doc, &variant_summaries);
 
-    let help_consts: Vec<proc_macro2::TokenStream> = data_enum
+    let help_consts: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .map(|v| {
@@ -1162,7 +1185,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let help_for_arms: Vec<proc_macro2::TokenStream> = data_enum
+    let help_for_arms: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .map(|v| {
@@ -1294,7 +1317,7 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
         }
     });
 
-    let help_for_delegates: Vec<proc_macro2::TokenStream> = data_enum
+    let help_for_delegates: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .filter_map(|v| match &v.fields {
@@ -1310,7 +1333,7 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
         .collect();
 
     // Build group sections: (header, member_HELP_LINES) pairs.
-    let section_entries: Vec<proc_macro2::TokenStream> = data_enum
+    let section_entries: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .filter_map(|v| match &v.fields {
@@ -1354,7 +1377,7 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
 
     let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
 
-    let autocomplete_delegates: Vec<proc_macro2::TokenStream> = data_enum
+    let autocomplete_delegates: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .filter_map(|v| match &v.fields {
