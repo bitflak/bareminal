@@ -35,7 +35,6 @@ tokio = { version = "1", features = [
 
 
 [features]
-default = ["async-std"]
 std = ["alloc"]
 alloc = []
 async-no-std = ["embedded-io-async", "embassy-futures", "defmt"]
