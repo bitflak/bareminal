@@ -3,6 +3,7 @@
 
 use core::mem::MaybeUninit;
 
+use bareminal_cli::process::RuntimeError;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::exti::{self};
@@ -236,7 +237,12 @@ async fn usart_task(
                                         break;
                                     }
                                     Ok(Some((command, writer))) => {
-                                        process_command(command, writer, &mut rx).await;
+                                        if let Err(err) =
+                                            process_command(command, writer, &mut rx).await
+                                        {
+                                            error!("{}", err);
+                                            break 'outer;
+                                        };
                                     }
                                     Err(err) => {
                                         error!("{}", err);
@@ -249,7 +255,6 @@ async fn usart_task(
                 }
                 Err(err) => {
                     error!("{}", err);
-                    break;
                 }
             }
         }
@@ -264,7 +269,7 @@ async fn process_command<
     command: CommandGroup<'a>,
     writer: &'a mut CommandWriter<W>,
     reader: &'a mut R,
-) {
+) -> Result<(), RuntimeError> {
     let some_json = SomeJson {
         pin: 42,
         value: 42,
@@ -274,48 +279,47 @@ async fn process_command<
     match command {
         CommandGroup::Base(base_command) => match base_command {
             BaseCommands::SimpleCommand => {
-                let s: String<64> = heapless::format!("simple command").unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("simple command")?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Int(value) => {
-                let s: String<64> = heapless::format!("{:?}", value).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("{:?}", value)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Float(value) => {
-                let s: String<64> = heapless::format!("{:?}", value).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("{:?}", value)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Char(value) => {
-                let s: String<64> = heapless::format!("{:?}", value).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("{:?}", value)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Set(value) => {
-                let s: String<64> = heapless::format!("{:?}", value).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("{:?}", value)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Compound((value1, value2)) => {
-                let s: String<64> = heapless::format!("{:?}, {:?}", value1, value2).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("{:?}, {:?}", value1, value2)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::List => {
                 let rows: &[&[&str]] = &[&["Pin A", "30"], &["Pin B", "42"]];
-                let _ = writer.write_list::<256>(rows, true).await;
+                writer.write_list::<256>(rows, true).await?;
             }
             BaseCommands::Table => {
                 let headers = ["Name", "Value"];
                 let rows: &[&[&str]] = &[&["Pin A", "30"], &["Pin B", "42"]];
-                let _ = writer.write_table::<256>(&headers, rows).await;
+                writer.write_table::<256>(&headers, rows).await?;
             }
             BaseCommands::SomeJson { json, pretty } => {
                 if let Some(true) = json {
-                    let _ = writer
+                    writer
                         .write_json::<256>(&some_json, pretty.unwrap_or(false))
-                        .await;
+                        .await?;
                 } else {
                     let s: String<64> =
-                        heapless::format!("(pin: {}, value: {})", some_json.pin, some_json.value)
-                            .unwrap();
-                    let _ = writer.write_line(s.as_bytes()).await;
+                        heapless::format!("(pin: {}, value: {})", some_json.pin, some_json.value)?;
+                    writer.write_line(s.as_bytes()).await?;
                 };
             }
             BaseCommands::Command {
@@ -323,30 +327,30 @@ async fn process_command<
                 name2,
                 some_flag,
             } => {
-                let s: String<128> =
-                    heapless::format!("{:?} {:?} {:?}", name, name2, some_flag).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<128> = heapless::format!("{:?} {:?} {:?}", name, name2, some_flag)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Modes(value) => {
-                let s: String<64> = heapless::format!("{:?}", value).unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("{:?}", value)?;
+                writer.write_line(s.as_bytes()).await?;
             }
             BaseCommands::Loop => {
-                let _ = writer
+                writer
                     .write_loop::<128>(reader, async move |mut buf| {
                         let headers = ["Name", "Value"];
                         let rows: &[&[&str]] = &[&["Pin A", "30"], &["Pin B", "42"]];
                         buf.write_table(&headers, rows).unwrap();
                         buf
                     })
-                    .await;
+                    .await?;
             }
         },
         CommandGroup::Second(command) => match command {
             SecondCommandGroup::Simple2 => {
-                let s: String<64> = heapless::format!("simple2 command").unwrap();
-                let _ = writer.write_line(s.as_bytes()).await;
+                let s: String<64> = heapless::format!("simple2 command")?;
+                writer.write_line(s.as_bytes()).await?;
             }
         },
     };
+    Ok(())
 }

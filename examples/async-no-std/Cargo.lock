@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "bareminal_cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "defmt 1.0.1",
  "embassy-futures",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "bareminal_macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bareminal_cli",
  "heapless 0.9.3",

@@ -198,7 +198,12 @@ loop {
                                 break;
                             }
                             Ok(Some((command, writer))) => {
-                                process_command(command, writer).await;
+                                if let Err(err) =
+                                    process_command(command, writer, &mut rx).await
+                                {
+                                    error!("{}", err);
+                                    break 'outer;
+                                };
                             }
                             Err(err) => {
                                 error!("{}", err);
@@ -223,17 +228,17 @@ async fn process_command<
 >(
     command: CommandGroup,
     writer: &'a mut CommandWriter<W>,
-) {
+) -> Result<(), RuntimeError> {
     match command {
         CommandGroup::Base(base_command) => match base_command {
             BaseCommands::Simple => {
-                let _ = writer
+                writer
                     .write_line("simple command".as_bytes())
-                    .await
-                    .inspect_err(|err| error!("{}", err));
+                    .await?;
             }
         },
     };
+    Ok(())
 }
 ```
 

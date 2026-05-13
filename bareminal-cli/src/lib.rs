@@ -113,6 +113,7 @@
 //! ### Async no_std
 //!
 //! ```rust,ignore
+//! use tokio::io;
 //!
 //! #[derive(Debug, Command)]
 //! enum BaseCommands {
@@ -127,84 +128,56 @@
 //! const MAX_CMD_BUFFER: usize = 256;
 //! const HISTORY_SIZE: usize = 3;
 //!
-//! let (tx, rx) = uart.split();
+//! let stdin = io::stdin();
+//! let mut stdin = io::stdin();
+//! let mut buf = [0u8; 4];
 //!
-//! let mut cli =
-//!     match Bareminal::<CommandGroup, _, MAX_CMD_BUFFER, HISTORY_SIZE>::new(tx).await {
-//!         Ok(cli) => cli,
-//!         Err(err) => {
-//!             error!("{}", err);
-//!             return;
-//!         }
-//!     };
-//!
-//! let buf = unsafe {
-//!     static mut BUF: [u8; 256] = [0u8; 256];
-//!     &mut *core::ptr::addr_of_mut!(BUF)
-//! };
-//!
-//! let mut rx = rx.into_ring_buffered(buf);
-//!
-//! let mut read_buf = [0u8; 64];
+//! let mut cli = Bareminal::<CommandGroup, _, MAX_CMD_BUFFER, HISTORY_SIZE>::new(io::stdout())
+//!     .await
+//!     .map_err(|_| anyhow::Error::msg("CLI initialization failed"))?;
 //!
 //! loop {
-//!     match rx.read(&mut read_buf[..]).await {
-//!         Ok(received) => {
-//!             'outer: for &byte in &read_buf[..received] {
-//!                 if let Ok(ready) = cli
-//!                     .add_byte(byte)
-//!                     .await
-//!                     .inspect_err(|err| error!("{}", err))
-//!                     && ready
-//!                 {
-//!                     loop {
-//!                         let result = cli.next_command().await;
-//!                         match result {
-//!                             Ok(None) => {
-//!                                 if let Err(err) = cli.finalize().await {
-//!                                     error!("{}", err);
-//!                                     break 'outer;
+//!     let read = stdin.read(&mut buf).await?;
 //!
-//!                                 }
-//!                                 break;
+//!     if read == 0 {
+//!         break;
+//!     }
+//!
+//!     if buf[0] == 0x03 {
+//!         break;
+//!     }
+//!
+//!     'outer: for &byte in &buf[..read] {
+//!         if let Ok(ready) = cli
+//!             .add_byte(byte)
+//!             .await
+//!             .inspect_err(|err| eprintln!("{}", err))
+//!             && ready
+//!         {
+//!             loop {
+//!                 let result = cli.next_command().await;
+//!                 match result {
+//!                     Ok(None) => {
+//!                         if let Err(err) = cli.finalize().await {
+//!                             eprintln!("{}", err);
+//!                             break 'outer;
+//!                         }
+//!                         break;
+//!                     }
+//!                     Ok(Some((command, writer))) => match command {
+//!                         CommandGroup::Base(base_command) => match base_command {
+//!                             BaseCommands::Simple => {
 //!                             }
-//!                             Ok(Some((command, writer))) => {
-//!                                 process_command(command, writer).await;
-//!                             }
-//!                             Err(err) => {
-//!                                 error!("{}", err);
-//!                                 break 'outer;
-//!                             }
-//!                         };
+//!                         },
+//!                     },
+//!                     Err(err) => {
+//!                         eprintln!("{}", err);
+//!                         break 'outer;
 //!                     }
 //!                 }
 //!             }
 //!         }
-//!         Err(err) => {
-//!             error!("{}", err);
-//!             break;
-//!         }
 //!     }
-//! }
-//!
-//! async fn process_command<
-//!     'a,
-//!     W: embedded_io_async::Write + Unpin,
-//!     R: embedded_io_async::Read + Unpin + ?Sized,
-//! >(
-//!     command: CommandGroup,
-//!     writer: &'a mut CommandWriter<W>,
-//! ) {
-//!     match command {
-//!         CommandGroup::Base(base_command) => match base_command {
-//!             BaseCommands::Simple => {
-//!                 let _ = writer
-//!                     .write_line("simple command".as_bytes())
-//!                     .await
-//!                     .inspect_err(|err| error!("{}", err));
-//!             }
-//!         },
-//!     };
 //! }
 //! ```
 //!
@@ -380,6 +353,7 @@ mod cli_async;
 mod cli_sync;
 
 pub mod cli {
+    #[allow(unused_imports)]
     use super::*;
 
     #[cfg(all(

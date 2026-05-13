@@ -9,9 +9,6 @@ use core::option::Option::Some;
 use core::prelude::rust_2024::derive;
 use core::result::Result;
 
-#[cfg(not(feature = "async-no-std"))]
-use core::write;
-
 use crate::tokens::TokensIter;
 
 #[derive(Debug, PartialEq)]
@@ -170,37 +167,40 @@ impl Iterator for HelpIter {
 /// Errors that can occur during runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
-    /// The buffer didn't have enough remaining capacity.
+    AllocFailed,
     BufferTooSmall,
-    /// A row had a different number of columns.
     ColumnMismatch,
-    /// Write operation failed.
-    WriteFailed,
-    /// Flush operation failed.
+    Error,
     FlushFailed,
-    /// Generic format error.
-    FmtError,
-    /// Enqueue history failed.
     HistoryQueueError,
+    Msg(&'static str),
+    ReadFailed,
+    WriteFailed,
 }
+
+#[cfg(not(feature = "async-no-std"))]
+use core::write;
 
 #[cfg(not(feature = "async-no-std"))]
 impl core::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            RuntimeError::AllocFailed => write!(f, "Allocation failed"),
             RuntimeError::BufferTooSmall => write!(f, "Buffer too small"),
             RuntimeError::ColumnMismatch => write!(f, "Column mismatch"),
-            RuntimeError::WriteFailed => write!(f, "Write failed"),
+            RuntimeError::Error => write!(f, "Runtime error"),
             RuntimeError::FlushFailed => write!(f, "Flush failed"),
-            RuntimeError::FmtError => write!(f, "Format error"),
             RuntimeError::HistoryQueueError => write!(f, "Enqueue history error"),
+            RuntimeError::Msg(msg) => write!(f, "{}", msg),
+            RuntimeError::ReadFailed => write!(f, "Read failed"),
+            RuntimeError::WriteFailed => write!(f, "Write failed"),
         }
     }
 }
 
 impl From<core::fmt::Error> for RuntimeError {
     fn from(_: core::fmt::Error) -> Self {
-        RuntimeError::FmtError
+        RuntimeError::Error
     }
 }
 
@@ -211,12 +211,15 @@ use defmt::{Format, Formatter, write};
 impl Format for RuntimeError {
     fn format(&self, f: Formatter) {
         match self {
+            RuntimeError::AllocFailed => write!(f, "Allocation failed"),
             RuntimeError::BufferTooSmall => write!(f, "Buffer too small"),
             RuntimeError::ColumnMismatch => write!(f, "Column mismatch"),
-            RuntimeError::WriteFailed => write!(f, "Write failed"),
+            RuntimeError::Error => write!(f, "Runtime error"),
             RuntimeError::FlushFailed => write!(f, "Flush failed"),
-            RuntimeError::FmtError => write!(f, "Format error"),
             RuntimeError::HistoryQueueError => write!(f, "Enqueue history error"),
+            RuntimeError::Msg(msg) => write!(f, "{}", msg),
+            RuntimeError::ReadFailed => write!(f, "Write failed"),
+            RuntimeError::WriteFailed => write!(f, "Write failed"),
         }
     }
 }
