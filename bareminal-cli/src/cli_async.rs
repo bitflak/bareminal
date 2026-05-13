@@ -384,7 +384,6 @@ where
                         self.writer.write(INSERT_CHAR).await?;
                         self.writer.write(bytes).await?;
                     }
-                    self.redraw_prompt().await?;
                     self.writer.flush().await?;
                 }
             }
