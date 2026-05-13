@@ -11,13 +11,16 @@ use syn::{
 
 // ── Type analysis ─────────────────────────────────────────────────────────
 
+fn is_ident_type(ty: &Type, name: &str) -> bool {
+    matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident(name))
+}
+
 fn is_str_slice(ty: &Type) -> bool {
-    if let Type::Reference(r) = ty
-        && let Type::Path(TypePath { qself: None, path }) = &*r.elem
-    {
-        return path.is_ident("str");
-    }
-    false
+    matches!(ty, Type::Reference(r) if is_ident_type(&r.elem, "str"))
+}
+
+fn is_bool(ty: &Type) -> bool {
+    is_ident_type(ty, "bool")
 }
 
 fn unwrap_option(ty: &Type) -> Option<&Type> {
@@ -41,22 +44,10 @@ fn unwrap_option(ty: &Type) -> Option<&Type> {
 }
 
 fn unwrap_tuple(ty: &Type) -> Option<&Punctuated<Type, Token![,]>> {
-    match ty {
-        Type::Tuple(TypeTuple { elems, .. }) => {
-            if !elems.is_empty() {
-                return Some(elems);
-            }
-        }
-        _ => return None,
-    }
-    None
-}
-
-fn is_bool(ty: &Type) -> bool {
-    if let Type::Path(TypePath { qself: None, path }) = ty {
-        return path.is_ident("bool");
-    }
-    false
+    let Type::Tuple(TypeTuple { elems, .. }) = ty else {
+        return None;
+    };
+    (!elems.is_empty()).then_some(elems)
 }
 
 // ── Lifetime rewriter ─────────────────────────────────────────────────────
@@ -74,19 +65,10 @@ impl VisitMut for LifetimeRewriter {
     }
 }
 
-fn rewrite_lifetimes_to_par(ty: &Type) -> Type {
+fn rewrite_lifetimes(ty: &Type, target: &str) -> Type {
     let mut ty = ty.clone();
     LifetimeRewriter {
-        target: Lifetime::new("'par", Span::call_site()),
-    }
-    .visit_type_mut(&mut ty);
-    ty
-}
-
-fn rewrite_lifetimes_to_static(ty: &Type) -> Type {
-    let mut ty = ty.clone();
-    LifetimeRewriter {
-        target: Lifetime::new("'static", Span::call_site()),
+        target: Lifetime::new(target, Span::call_site()),
     }
     .visit_type_mut(&mut ty);
     ty
@@ -94,14 +76,25 @@ fn rewrite_lifetimes_to_static(ty: &Type) -> Type {
 
 // ── Expression group unwrapping ───────────────────────────────────────────
 
-fn unwrap_groups(expr: &Expr) -> &Expr {
-    let mut e = expr;
+fn unwrap_groups(mut e: &Expr) -> &Expr {
     loop {
-        match e {
-            Expr::Group(g) => e = &g.expr,
-            Expr::Paren(p) => e = &p.expr,
+        e = match e {
+            Expr::Group(g) => &g.expr,
+            Expr::Paren(p) => &p.expr,
             _ => return e,
-        }
+        };
+    }
+}
+
+fn string_lit(expr: &Expr) -> Option<String> {
+    if let Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Str(s),
+        ..
+    }) = unwrap_groups(expr)
+    {
+        Some(s.value())
+    } else {
+        None
     }
 }
 
@@ -116,6 +109,17 @@ struct SetAttrs {
     one_of: Option<(Expr, Vec<String>)>,
 }
 
+impl SetAttrs {
+    /// Resolve the short flag, expanding the empty-string sentinel to "-{first char}".
+    fn resolved_short(&self, field_name: &str) -> Option<String> {
+        match self.short.as_deref() {
+            Some("") => field_name.chars().next().map(|c| format!("-{c}")),
+            Some(s) => Some(s.to_string()),
+            None => None,
+        }
+    }
+}
+
 fn parse_set_attrs(attrs: &[Attribute]) -> Result<SetAttrs, syn::Error> {
     let mut result = SetAttrs::default();
 
@@ -126,29 +130,28 @@ fn parse_set_attrs(attrs: &[Attribute]) -> Result<SetAttrs, syn::Error> {
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("short") {
-                if meta.input.peek(Token![=]) {
-                    let value = meta.value()?;
-                    let lit: syn::LitChar = value.parse()?;
-                    result.short = Some(format!("-{}", lit.value()));
+                result.short = Some(if meta.input.peek(Token![=]) {
+                    let lit: syn::LitChar = meta.value()?.parse()?;
+                    format!("-{}", lit.value())
                 } else {
-                    result.short = Some(String::new());
-                }
-                Ok(())
-            } else if meta.path.is_ident("default") {
-                let value = meta.value()?;
-                result.default = Some(value.parse()?);
-                Ok(())
-            } else if meta.path.is_ident("min") {
-                let value = meta.value()?;
-                result.min = Some(value.parse()?);
-                Ok(())
-            } else if meta.path.is_ident("max") {
-                let value = meta.value()?;
-                result.max = Some(value.parse()?);
-                Ok(())
-            } else if meta.path.is_ident("one_of") {
-                let value = meta.value()?;
-                let expr: Expr = value.parse()?;
+                    String::new()
+                });
+                return Ok(());
+            }
+            if meta.path.is_ident("default") {
+                result.default = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("min") {
+                result.min = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("max") {
+                result.max = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("one_of") {
+                let expr: Expr = meta.value()?.parse()?;
                 let elem_strs = match unwrap_groups(&expr) {
                     Expr::Array(arr) => arr
                         .elems
@@ -172,18 +175,18 @@ fn parse_set_attrs(attrs: &[Attribute]) -> Result<SetAttrs, syn::Error> {
                     }
                 };
                 result.one_of = Some((expr, elem_strs));
-                Ok(())
-            } else {
-                let key = meta
-                    .path
-                    .get_ident()
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
-                Err(meta.error(format!(
-                    "unknown attribute key `{}`; expected `short`, `default`, `min`, `max`, or `one_of`",
-                    key
-                )))
+                return Ok(());
             }
+
+            let key = meta
+                .path
+                .get_ident()
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            Err(meta.error(format!(
+                "unknown attribute key `{}`; expected `short`, `default`, `min`, `max`, or `one_of`",
+                key
+            )))
         })?;
     }
 
@@ -206,86 +209,75 @@ fn array_is_all_str_literals(expr: &Expr) -> bool {
     }
 }
 
-fn default_value_expr(expr: &Expr, target_ty: &Type) -> proc_macro2::TokenStream {
-    let target_ty_par = rewrite_lifetimes_to_par(target_ty);
-
-    if let Expr::Lit(syn::ExprLit {
-        lit: syn::Lit::Str(s),
-        ..
-    }) = unwrap_groups(expr)
-    {
-        let s_value = s.value();
-
-        // Case 1: target is &str — splice the literal directly.
-        if is_str_slice(target_ty) {
-            return quote! {
-                {
-                    let __v: #target_ty_par = #s_value;
-                    __v
-                }
-            };
-        }
-
-        // Case 2: target is Option<T>.
-        if let Some(inner) = unwrap_option(target_ty) {
-            // Option<&str> — wrap the literal in Some.
-            if is_str_slice(inner) {
-                return quote! {
-                    {
-                        let __v: #target_ty_par = ::core::option::Option::Some(#s_value);
-                        __v
-                    }
-                };
+/// Emit a `match FromStr::from_str(__default_str) { ... }` block, optionally
+/// wrapping the success value in `Some(...)`.
+fn from_str_default_block(
+    parse_ty: &Type,
+    s_value: &str,
+    type_str: &str,
+    wrap_some: bool,
+) -> proc_macro2::TokenStream {
+    let parse_ty_par = rewrite_lifetimes(parse_ty, "'par");
+    let ok_arm = if wrap_some {
+        quote! { ::core::option::Option::Some(parsed) }
+    } else {
+        quote! { parsed }
+    };
+    quote! {
+        {
+            let __default_str: &str = #s_value;
+            match <#parse_ty_par as ::core::str::FromStr>::from_str(__default_str) {
+                Ok(parsed) => #ok_arm,
+                Err(_) => return Err(
+                    ::bareminal_cli::process::ProcessError::InvalidValue((
+                        "default",
+                        #type_str,
+                        __default_str,
+                    ))
+                ),
             }
-            // Option<T> for other T — parse via FromStr, wrap in Some.
-            let inner_par = rewrite_lifetimes_to_par(inner);
-            let type_str = quote!(#inner).to_string();
-            return quote! {
-                {
-                    let __default_str: &str = #s_value;
-                    let __v: #target_ty_par = match
-                        <#inner_par as ::core::str::FromStr>::from_str(__default_str)
-                    {
-                        Ok(parsed) => ::core::option::Option::Some(parsed),
-                        Err(_) => return Err(
-                            ::bareminal_cli::process::ProcessError::InvalidValue((
-                                "default",
-                                #type_str,
-                                __default_str,
-                            ))
-                        ),
-                    };
-                    __v
-                }
-            };
         }
+    }
+}
 
-        // Case 3: any other type — parse via FromStr.
-        let type_str = quote!(#target_ty).to_string();
+fn default_value_expr(expr: &Expr, target_ty: &Type) -> proc_macro2::TokenStream {
+    let target_ty_par = rewrite_lifetimes(target_ty, "'par");
+
+    let Some(s_value) = string_lit(expr) else {
+        // Non-string-literal default: splice the typed expression directly.
         return quote! {
             {
-                let __default_str: &str = #s_value;
-                let __v: #target_ty_par = match
-                    <#target_ty_par as ::core::str::FromStr>::from_str(__default_str)
-                {
-                    Ok(parsed) => parsed,
-                    Err(_) => return Err(
-                        ::bareminal_cli::process::ProcessError::InvalidValue((
-                            "default",
-                            #type_str,
-                            __default_str,
-                        ))
-                    ),
-                };
+                let __v: #target_ty_par = #expr;
                 __v
             }
         };
-    }
+    };
 
-    // Non-string-literal default: splice the typed expression directly.
+    let inner = match (is_str_slice(target_ty), unwrap_option(target_ty)) {
+        // Case 1: target is &str — splice the literal directly.
+        (true, _) => quote! { #s_value },
+
+        // Case 2a: Option<&str> — wrap the literal in Some.
+        (_, Some(inner)) if is_str_slice(inner) => {
+            quote! { ::core::option::Option::Some(#s_value) }
+        }
+
+        // Case 2b: Option<T> for other T — parse via FromStr, wrap in Some.
+        (_, Some(inner)) => {
+            let type_str = quote!(#inner).to_string();
+            from_str_default_block(inner, &s_value, &type_str, true)
+        }
+
+        // Case 3: any other type — parse via FromStr.
+        _ => {
+            let type_str = quote!(#target_ty).to_string();
+            from_str_default_block(target_ty, &s_value, &type_str, false)
+        }
+    };
+
     quote! {
         {
-            let __v: #target_ty_par = #expr;
+            let __v: #target_ty_par = #inner;
             __v
         }
     }
@@ -302,7 +294,7 @@ fn range_check(
         return quote! {};
     }
 
-    let target_ty_par = rewrite_lifetimes_to_par(target_ty);
+    let target_ty_par = rewrite_lifetimes(target_ty, "'par");
     let type_str = quote!(#target_ty).to_string();
 
     let min_str = min.map(pretty_expr).unwrap_or_else(|| "none".to_string());
@@ -375,7 +367,7 @@ fn one_of_checks(
         };
         (pre, quote! {})
     } else {
-        let target_ty_par = rewrite_lifetimes_to_par(target_ty);
+        let target_ty_par = rewrite_lifetimes(target_ty, "'par");
         let post = quote! {
             {
                 let __allowed: &[#target_ty_par] = &#array_expr;
@@ -427,6 +419,12 @@ fn extract_doc(attrs: &[Attribute]) -> Vec<String> {
     lines
 }
 
+fn clean_ts(s: String) -> String {
+    s.replace(" :: ", "::")
+        .replace(" < ", "<")
+        .replace(" > ", ">")
+}
+
 fn pretty_expr(expr: &Expr) -> String {
     // Special-case unary negation of a literal: render as "-N" with no space.
     if let Expr::Unary(syn::ExprUnary {
@@ -439,20 +437,11 @@ fn pretty_expr(expr: &Expr) -> String {
         return format!("-{}", quote!(#inner));
     }
 
-    quote!(#expr)
-        .to_string()
-        .replace(" :: ", "::")
-        .replace(" < ", "<")
-        .replace(" > ", ">")
-        .replace(" > ", ">")
+    clean_ts(quote!(#expr).to_string())
 }
 
 fn pretty_type(ty: &Type) -> String {
-    quote!(#ty)
-        .to_string()
-        .replace(" :: ", "::")
-        .replace(" < ", "<")
-        .replace(" > ", ">")
+    clean_ts(quote!(#ty).to_string())
 }
 
 fn pretty_type_bare(ty: &Type) -> String {
@@ -467,12 +456,9 @@ fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(d) = &set.default {
         let inner = unwrap_some_for_display(d);
-        let display = match unwrap_groups(inner) {
-            Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) => s.value(),
-            other => pretty_expr(other),
+        let display = match string_lit(inner) {
+            Some(s) => s,
+            None => pretty_expr(unwrap_groups(inner)),
         };
         lines.push(format!("{}[default: {}]", indent, display));
     }
@@ -510,25 +496,9 @@ fn build_field_help_lines(field: &syn::Field) -> Vec<String> {
         long_flag.clone()
     };
 
-    let short_part = match &set.short {
-        Some(s) if s.is_empty() => field_name
-            .chars()
-            .next()
-            .map(|c| {
-                if optional {
-                    format!(", [-{}]", c)
-                } else {
-                    format!(", -{}", c)
-                }
-            })
-            .unwrap_or_default(),
-        Some(s) => {
-            if optional {
-                format!(", [{}]", s)
-            } else {
-                format!(", {}", s)
-            }
-        }
+    let short_part = match set.resolved_short(&field_name) {
+        Some(s) if optional => format!(", [{}]", s),
+        Some(s) => format!(", {}", s),
         None => String::new(),
     };
 
@@ -553,7 +523,6 @@ fn build_field_help_lines(field: &syn::Field) -> Vec<String> {
         lines.push(format!("{}{}", FLAG_INDENT, line));
     }
 
-    let optional = unwrap_option(&field.ty).is_some();
     if optional && set.default.is_none() {
         lines.push(format!("{}[optional]", FLAG_INDENT));
     }
@@ -662,17 +631,14 @@ fn build_top_level_help_lines(
     general_doc: &[String],
     variants: &[(String, Vec<String>)],
 ) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    for line in general_doc {
-        lines.push(line.clone());
-    }
+    let mut lines: Vec<String> = general_doc.to_vec();
     if !general_doc.is_empty() {
         lines.push(String::new());
     }
     lines.push("Commands:".to_string());
 
     let max_name = variants.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    // Invariant: each name.len() <= max_name, so col - name.len() >= 4.
     let col = max_name + 4;
 
     for (name, doc) in variants {
@@ -720,7 +686,7 @@ fn parse_tuple_expr(
             let var = quote::format_ident!("__elem_{}", i);
             if let Some(inner) = unwrap_option(elem_ty) {
                 let inner_parse = parse_element_value_expr(inner, &elem_context);
-                let binding_ty = rewrite_lifetimes_to_par(elem_ty);
+                let binding_ty = rewrite_lifetimes(elem_ty, "'par");
                 quote! {
                     let #var: #binding_ty = match tokens.next() {
                         None => None,
@@ -792,6 +758,22 @@ fn parse_expr_with_check(
     }
 }
 
+// Emit the `let no_payload = ...;` block used to detect whether a
+// single-field tuple variant has been given a payload token.
+fn no_payload_check() -> proc_macro2::TokenStream {
+    quote! {
+        let no_payload = match tokens.peek() {
+            None => true,
+            Some(t) if t == "--" => { tokens.next(); true }
+            Some(t) => {
+                let b = t.as_bytes();
+                // It's a flag if it starts with `-` followed by a non-digit, non-`.`.
+                b.len() >= 2 && b[0] == b'-' && !matches!(b[1], b'0'..=b'9' | b'.')
+            }
+        };
+    }
+}
+
 // ── Struct-variant arm ────────────────────────────────────────────────────
 
 fn struct_variant_arm(
@@ -819,14 +801,7 @@ fn struct_variant_arm(
             }
         };
 
-        let short_flag: Option<String> = match set_attrs.short {
-            Some(s) if s.is_empty() => {
-                let field_name = field_ident.to_string();
-                field_name.chars().next().map(|c| format!("-{}", c))
-            }
-            Some(s) => Some(s),
-            None => None,
-        };
+        let short_flag = set_attrs.resolved_short(&field_ident.to_string());
 
         let mut flag_patterns: Vec<proc_macro2::TokenStream> = vec![quote! { #long_flag }];
         if let Some(short) = &short_flag {
@@ -846,7 +821,7 @@ fn struct_variant_arm(
         let min = set_attrs.min;
         let max = set_attrs.max;
         let one_of = set_attrs.one_of;
-        let binding_ty = rewrite_lifetimes_to_par(field_ty);
+        let binding_ty = rewrite_lifetimes(field_ty, "'par");
 
         if let Some(inner) = unwrap_option(field_ty) {
             bindings.push(quote! {
@@ -1055,6 +1030,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
                 let min = variant_set.min;
                 let max = variant_set.max;
                 let one_of = variant_set.one_of;
+                let no_payload = no_payload_check();
 
                 if let Some(inner) = unwrap_option(ty) {
                     let (pre_check, post_check) = one_of_checks(
@@ -1078,31 +1054,22 @@ pub fn derive(input: TokenStream) -> TokenStream {
                         quote! { Ok(Self::Match::#variant_ident(None)) }
                     };
                     quote! {
-                    #variant_str => {
-                        let no_payload = match tokens.peek() {
-                            None => true,
-                            Some(t) if t == "--" => { tokens.next(); true }
-                            Some(t) => {
-                                let b = t.as_bytes();
-                                // It's a flag if it starts with `-` followed by a non-digit, non-`.`.
-                                b.len() >= 2 && b[0] == b'-' && !matches!(b[1], b'0'..=b'9' | b'.')
-                            }
-                            _ => false,
-                        };
-                        if no_payload {
-                            #empty_branch
-                        } else {
-                            match #parse {
-                                Ok(parsed) => {
-                                    #range
-                                    #post_check
-                                    Ok(Self::Match::#variant_ident(Some(parsed)))
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                    },
+                        #variant_str => {
+                            #no_payload
+                            if no_payload {
+                                #empty_branch
+                            } else {
+                                match #parse {
+                                    Ok(parsed) => {
+                                        #range
+                                        #post_check
+                                        Ok(Self::Match::#variant_ident(Some(parsed)))
                                     }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                        },
+                    }
                 } else {
                     let (pre_check, post_check) = one_of_checks(
                         &quote::format_ident!("parsed"),
@@ -1121,31 +1088,22 @@ pub fn derive(input: TokenStream) -> TokenStream {
                     if let Some(default_expr) = &variant_default {
                         let default_value = default_value_expr(default_expr, ty);
                         quote! {
-                        #variant_str => {
-                            let no_payload = match tokens.peek() {
-                                None => true,
-                                Some(t) if t == "--" => { tokens.next(); true }
-                                Some(t) => {
-                                    let b = t.as_bytes();
-                                    // It's a flag if it starts with `-` followed by a non-digit, non-`.`.
-                                    b.len() >= 2 && b[0] == b'-' && !matches!(b[1], b'0'..=b'9' | b'.')
-                                }
-                                _ => false,
-                            };
-                            if no_payload {
-                                Ok(Self::Match::#variant_ident(#default_value))
-                            } else {
-                                match #parse {
-                                    Ok(parsed) => {
-                                        #range
-                                        #post_check
-                                        Ok(Self::Match::#variant_ident(parsed))
+                            #variant_str => {
+                                #no_payload
+                                if no_payload {
+                                    Ok(Self::Match::#variant_ident(#default_value))
+                                } else {
+                                    match #parse {
+                                        Ok(parsed) => {
+                                            #range
+                                            #post_check
+                                            Ok(Self::Match::#variant_ident(parsed))
+                                        }
+                                        Err(e) => Err(e),
                                     }
-                                    Err(e) => Err(e),
                                 }
-                            }
-                        },
-                                            }
+                            },
+                        }
                     } else {
                         quote! {
                             #variant_str => {
@@ -1358,7 +1316,7 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
         .filter_map(|v| match &v.fields {
             Fields::Unnamed(unnamed) if unnamed.unnamed.len() == 1 => {
                 let inner_ty = &unnamed.unnamed[0].ty;
-                let inner_ty_static = rewrite_lifetimes_to_static(inner_ty);
+                let inner_ty_static = rewrite_lifetimes(inner_ty, "'static");
                 let header = format!("== {} ==", pretty_type_bare(inner_ty));
                 Some(quote! {
                     (#header, <#inner_ty_static>::HELP_LINES),
@@ -1370,10 +1328,7 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
 
     let general_doc = extract_doc(&ast.attrs);
 
-    let mut top_lines: Vec<String> = Vec::new();
-    for line in &general_doc {
-        top_lines.push(line.clone());
-    }
+    let mut top_lines: Vec<String> = general_doc.to_vec();
     if !general_doc.is_empty() {
         top_lines.push(String::new());
     }
