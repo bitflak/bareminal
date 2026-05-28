@@ -480,6 +480,7 @@ where
     }
 
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), RuntimeError> {
+        self.writer.write(CRCL).await?;
         self.writer.write(buf).await?;
         self.redraw_prompt().await?;
         self.writer.flush().await
