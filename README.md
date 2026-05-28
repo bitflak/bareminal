@@ -448,6 +448,14 @@ Taking the example from above you can write any command and combine the flags in
 command --some-flag --name hello
 ```
 
+You can also pass the argument values by position, or mix positional and named arguments:
+
+```bash
+command hello world --some-flag
+# or
+command --name2 world hello --some-flag
+```
+
 You can wrap the input into double quotes if you want to input a space separated string
 
 ```bash
