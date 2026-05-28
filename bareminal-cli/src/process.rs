@@ -107,6 +107,7 @@ pub enum HelpSegment {
 /// One yielded help line — borrowed for static segments, owned for
 /// runtime-rendered segments.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum HelpLine {
     Static(&'static str),
     Owned(heapless::String<MAX_HELP_LINE>),
