@@ -78,50 +78,106 @@ pub trait CommandsParser {
     type Match<'m>: core::fmt::Debug;
     fn autocomplete(name: &str) -> Option<&'static str>;
     fn parse<'p>(tokens: &mut TokensIter<'p>) -> Result<Self::Match<'p>, ProcessError<'p>>;
-    fn help() -> &'static [&'static str];
-    fn help_for(name: &str) -> &'static [&'static str];
+    fn help() -> &'static [HelpSegment];
+    fn help_for(name: &str) -> &'static [HelpSegment];
     fn help_lines() -> HelpIter {
         HelpIter::single(Self::help())
     }
 }
 
+/// Maximum rendered width of a single help line (used for runtime
+/// rendering of `one_of` segments whose values are not known at
+/// macro-expansion time). Lines that would overflow are truncated.
+pub const MAX_HELP_LINE: usize = 256;
+
+/// A help line as stored in `&'static` per-command help tables.
+///
+/// `Static` is the common case (compile-time known). `OneOf` carries a
+/// runtime slice of allowed values that the iterator formats into a
+/// single line as `<prefix>v1, v2, ...]`.
+#[derive(Debug, Clone, Copy)]
+pub enum HelpSegment {
+    Static(&'static str),
+    OneOf {
+        prefix: &'static str,
+        items: &'static [&'static str],
+    },
+}
+
+/// One yielded help line — borrowed for static segments, owned for
+/// runtime-rendered segments.
+#[derive(Debug)]
+pub enum HelpLine {
+    Static(&'static str),
+    Owned(heapless::String<MAX_HELP_LINE>),
+}
+
+impl AsRef<str> for HelpLine {
+    fn as_ref(&self) -> &str {
+        match self {
+            HelpLine::Static(s) => s,
+            HelpLine::Owned(s) => s.as_str(),
+        }
+    }
+}
+
+fn render_one_of(prefix: &str, items: &[&str]) -> heapless::String<MAX_HELP_LINE> {
+    let mut out: heapless::String<MAX_HELP_LINE> = heapless::String::new();
+    let _ = out.push_str(prefix);
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            let _ = out.push_str(", ");
+        }
+        let _ = out.push_str(item);
+    }
+    let _ = out.push(']');
+    out
+}
+
 pub enum HelpIter {
     Single {
-        lines: &'static [&'static str],
+        segments: &'static [HelpSegment],
         idx: usize,
     },
     Multi {
-        sections: &'static [(&'static str, &'static [&'static str])],
+        sections: &'static [(&'static str, &'static [HelpSegment])],
         section_idx: usize,
-        line_idx: usize,
+        seg_idx: usize,
         header_emitted: bool,
         blank_pending: bool,
     },
 }
 
 impl HelpIter {
-    pub const fn single(lines: &'static [&'static str]) -> Self {
-        HelpIter::Single { lines, idx: 0 }
+    pub const fn single(segments: &'static [HelpSegment]) -> Self {
+        HelpIter::Single { segments, idx: 0 }
     }
 
-    pub const fn multi(sections: &'static [(&'static str, &'static [&'static str])]) -> Self {
+    pub const fn multi(sections: &'static [(&'static str, &'static [HelpSegment])]) -> Self {
         HelpIter::Multi {
             sections,
             section_idx: 0,
-            line_idx: 0,
+            seg_idx: 0,
             header_emitted: false,
             blank_pending: false,
         }
     }
 }
 
+fn segment_to_line(seg: &HelpSegment) -> HelpLine {
+    match seg {
+        HelpSegment::Static(s) => HelpLine::Static(s),
+        HelpSegment::OneOf { prefix, items } => HelpLine::Owned(render_one_of(prefix, items)),
+    }
+}
+
 impl Iterator for HelpIter {
-    type Item = &'static str;
-    fn next(&mut self) -> Option<&'static str> {
+    type Item = HelpLine;
+    fn next(&mut self) -> Option<HelpLine> {
         match self {
-            HelpIter::Single { lines, idx } => {
-                if *idx < lines.len() {
-                    let line = lines[*idx];
+            HelpIter::Single { segments, idx } => {
+                if *idx < segments.len() {
+                    let line = segment_to_line(&segments[*idx]);
                     *idx += 1;
                     Some(line)
                 } else {
@@ -131,7 +187,7 @@ impl Iterator for HelpIter {
             HelpIter::Multi {
                 sections,
                 section_idx,
-                line_idx,
+                seg_idx,
                 header_emitted,
                 blank_pending,
             } => loop {
@@ -140,21 +196,21 @@ impl Iterator for HelpIter {
                 }
                 if *blank_pending {
                     *blank_pending = false;
-                    return Some("");
+                    return Some(HelpLine::Static(""));
                 }
-                let (header, lines) = sections[*section_idx];
+                let (header, segments) = sections[*section_idx];
                 if !*header_emitted && !header.is_empty() {
                     *header_emitted = true;
-                    return Some(header);
+                    return Some(HelpLine::Static(header));
                 }
-                if *line_idx < lines.len() {
-                    let line = lines[*line_idx];
-                    *line_idx += 1;
+                if *seg_idx < segments.len() {
+                    let line = segment_to_line(&segments[*seg_idx]);
+                    *seg_idx += 1;
                     return Some(line);
                 }
                 // Section finished — advance and queue a blank line if more sections follow.
                 *section_idx += 1;
-                *line_idx = 0;
+                *seg_idx = 0;
                 *header_emitted = false;
                 if *section_idx < sections.len() {
                     *blank_pending = true;

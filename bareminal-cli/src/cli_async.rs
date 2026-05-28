@@ -28,7 +28,7 @@ use crate::{
     bytes::*,
     cmdline,
     input::{Control, InputParser, InputType},
-    process::{CommandsParser, ProcessError, RuntimeError},
+    process::{CommandsParser, HelpIter, ProcessError, RuntimeError},
 };
 
 pub struct CommandWriter<W: AsyncWrite + Unpin> {
@@ -436,7 +436,7 @@ where
                 if help.is_empty() {
                     self.writer.write_line("Unknown command".as_bytes()).await?;
                 }
-                self.writer.write_lines(help).await?;
+                self.writer.write_lines(HelpIter::single(help)).await?;
             } else {
                 let help = C::help_lines();
                 self.writer.write_lines(help).await?;
@@ -563,14 +563,24 @@ mod tests {
             }
         }
 
-        fn help() -> &'static [&'static str] {
-            &["Test commands:", "  hello", "  echo <text>"]
+        fn help() -> &'static [crate::process::HelpSegment] {
+            use crate::process::HelpSegment::Static;
+            &[
+                Static("Test commands:"),
+                Static("  hello"),
+                Static("  echo <text>"),
+            ]
         }
 
-        fn help_for(name: &str) -> &'static [&'static str] {
+        fn help_for(name: &str) -> &'static [crate::process::HelpSegment] {
+            use crate::process::HelpSegment::Static;
             match name {
-                "hello" => &["== hello ==", "say hello", "hello"],
-                "echo" => &["== echo ==", "echo a value", "echo <text>"],
+                "hello" => &[Static("== hello =="), Static("say hello"), Static("hello")],
+                "echo" => &[
+                    Static("== echo =="),
+                    Static("echo a value"),
+                    Static("echo <text>"),
+                ],
                 _ => &[],
             }
         }

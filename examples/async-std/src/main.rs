@@ -11,6 +11,8 @@ use bareminal_macros::{Command, CommandGroup};
 
 use core::fmt;
 
+const VARIANTS: [&str; 3] = ["foo", "bar", "baz"];
+
 /// General command description.
 /// Multiline also possible.
 #[derive(Debug, Command)]
@@ -31,6 +33,9 @@ enum BaseCommands<'a> {
     /// You can define a set of possible values by one_of attribute
     #[set(default = 'a', one_of = ['a', 'b'])]
     Set(char),
+    /// one_of parser accepts any expression
+    #[set(default = "dog", one_of = &VARIANTS)]
+    Str(&'a str),
     /// Compound values are possible too
     #[set(default = (42, 42), min = (1,1), max = (42,42))]
     Compound((i32, i32)),
@@ -209,6 +214,10 @@ async fn main() -> anyhow::Result<()> {
                             CommandGroup::Base(base_command) => match base_command {
                                 BaseCommands::SimpleCommand => {
                                     let _ = writer.write_line("Simple command".as_bytes()).await;
+                                }
+                                BaseCommands::Str(value) => {
+                                    let _ =
+                                        writer.write_line(format!("{:?}", value).as_bytes()).await;
                                 }
                                 BaseCommands::Int(value) => {
                                     let _ =

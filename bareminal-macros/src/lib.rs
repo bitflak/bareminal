@@ -119,13 +119,31 @@ fn string_lit(expr: &Expr) -> Option<String> {
 
 // ── #[set(...)] attribute parsing ─────────────────────────────────────────
 
+/// Where the `one_of` values came from.
+///
+/// `StaticLit` means the user wrote a literal array (`[a, b, c]`) — the
+/// elements are known at macro-expansion time and can be baked into
+/// `static __ONE_OF_STRS` for error rendering and into help text.
+///
+/// `Runtime` means the user passed an arbitrary path/const expression
+/// (e.g. `MyType::VARIANTS`). Its value cannot be inspected at
+/// macro-expansion time, so:
+///   - the runtime check splices the expression in as a `&[&str]`,
+///   - the same expression is passed straight to `NotInSet` and to the
+///     help renderer at iteration time.
+#[derive(Clone)]
+enum OneOfKind {
+    StaticLit { elem_strs: Vec<String> },
+    Runtime,
+}
+
 #[derive(Default)]
 struct SetAttrs {
     short: Option<String>,
     default: Option<Expr>,
     min: Option<Expr>,
     max: Option<Expr>,
-    one_of: Option<(Expr, Vec<String>)>,
+    one_of: Option<(Expr, OneOfKind)>,
 }
 
 impl SetAttrs {
@@ -171,29 +189,30 @@ fn parse_set_attrs(attrs: &[Attribute]) -> Result<SetAttrs, syn::Error> {
             }
             if meta.path.is_ident("one_of") {
                 let expr: Expr = meta.value()?.parse()?;
-                let elem_strs = match unwrap_groups(&expr) {
-                    Expr::Array(arr) => arr
-                        .elems
-                        .iter()
-                        .map(|e| match unwrap_groups(e) {
-                            Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(s),
-                                ..
-                            }) => s.value(),
-                            Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Char(c),
-                                ..
-                            }) => c.value().to_string(),
-                            other => quote!(#other).to_string(),
-                        })
-                        .collect::<Vec<_>>(),
-                    _ => {
-                        return Err(meta.error(
-                            "expected an array expression like `one_of = [a, b, c]`",
-                        ));
+                let kind = match unwrap_groups(&expr) {
+                    Expr::Array(arr) => {
+                        let elem_strs = arr
+                            .elems
+                            .iter()
+                            .map(|e| match unwrap_groups(e) {
+                                Expr::Lit(syn::ExprLit {
+                                    lit: syn::Lit::Str(s),
+                                    ..
+                                }) => s.value(),
+                                Expr::Lit(syn::ExprLit {
+                                    lit: syn::Lit::Char(c),
+                                    ..
+                                }) => c.value().to_string(),
+                                other => quote!(#other).to_string(),
+                            })
+                            .collect::<Vec<_>>();
+                        OneOfKind::StaticLit { elem_strs }
                     }
+                    // Any other expression (path, call, ref to a const):
+                    // treat as `&'static [&'static str]` resolved at runtime.
+                    _ => OneOfKind::Runtime,
                 };
-                result.one_of = Some((expr, elem_strs));
+                result.one_of = Some((expr, kind));
                 return Ok(());
             }
 
@@ -378,48 +397,69 @@ fn range_check(
 
 fn one_of_checks(
     parsed_var: &syn::Ident,
-    one_of: Option<&(Expr, Vec<String>)>,
+    one_of: Option<&(Expr, OneOfKind)>,
     target: &TypeCtx,
     context_str: &str,
 ) -> (TokenStream2, TokenStream2) {
-    let Some((array_expr, elem_strs)) = one_of else {
+    let Some((expr, kind)) = one_of else {
         return (TokenStream2::new(), TokenStream2::new());
     };
 
-    let array_expr = unwrap_groups(array_expr);
+    let expr = unwrap_groups(expr);
     let type_str = &target.type_str;
 
-    if array_is_all_str_literals(array_expr) {
-        let pre = quote! {
-            {
-                let __allowed: &[&str] = &#array_expr;
-                if !__allowed.iter().any(|__a| *__a == value) {
-                    static __ONE_OF_STRS: &[&str] = &[#(#elem_strs),*];
-                    return Err(::bareminal_cli::process::ProcessError::NotInSet((
-                        #context_str,
-                        #type_str,
-                        __ONE_OF_STRS,
-                    )));
+    match kind {
+        OneOfKind::Runtime => {
+            // Assume the expression evaluates to `&'static [&'static str]`.
+            // We check the raw token before FromStr parsing and pass the
+            // user-supplied slice straight to `NotInSet`.
+            let pre = quote! {
+                {
+                    let __allowed: &'static [&'static str] = #expr;
+                    if !__allowed.iter().any(|__a| *__a == value) {
+                        return Err(::bareminal_cli::process::ProcessError::NotInSet((
+                            #context_str,
+                            #type_str,
+                            __allowed,
+                        )));
+                    }
                 }
-            }
-        };
-        (pre, TokenStream2::new())
-    } else {
-        let target_ty_par = &target.ty_par;
-        let post = quote! {
-            {
-                let __allowed: &[#target_ty_par] = &#array_expr;
-                if !__allowed.iter().any(|__a| __a == &#parsed_var) {
-                    static __ONE_OF_STRS: &[&str] = &[#(#elem_strs),*];
-                    return Err(::bareminal_cli::process::ProcessError::NotInSet((
-                        #context_str,
-                        #type_str,
-                        __ONE_OF_STRS,
-                    )));
+            };
+            (pre, TokenStream2::new())
+        }
+        OneOfKind::StaticLit { elem_strs } if array_is_all_str_literals(expr) => {
+            let pre = quote! {
+                {
+                    let __allowed: &[&str] = &#expr;
+                    if !__allowed.iter().any(|__a| *__a == value) {
+                        static __ONE_OF_STRS: &[&str] = &[#(#elem_strs),*];
+                        return Err(::bareminal_cli::process::ProcessError::NotInSet((
+                            #context_str,
+                            #type_str,
+                            __ONE_OF_STRS,
+                        )));
+                    }
                 }
-            }
-        };
-        (TokenStream2::new(), post)
+            };
+            (pre, TokenStream2::new())
+        }
+        OneOfKind::StaticLit { elem_strs } => {
+            let target_ty_par = &target.ty_par;
+            let post = quote! {
+                {
+                    let __allowed: &[#target_ty_par] = &#expr;
+                    if !__allowed.iter().any(|__a| __a == &#parsed_var) {
+                        static __ONE_OF_STRS: &[&str] = &[#(#elem_strs),*];
+                        return Err(::bareminal_cli::process::ProcessError::NotInSet((
+                            #context_str,
+                            #type_str,
+                            __ONE_OF_STRS,
+                        )));
+                    }
+                }
+            };
+            (TokenStream2::new(), post)
+        }
     }
 }
 
@@ -490,7 +530,32 @@ fn pretty_type_bare(ty: &Type) -> String {
     }
 }
 
-fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
+/// A single help line produced by the macro, in pre-emission form.
+///
+/// `Static` lines are compile-time strings. `OneOf` lines carry a
+/// runtime slice expression that the iterator will format at runtime.
+enum HelpEmit {
+    Static(String),
+    OneOf { prefix: String, items_expr: Expr },
+}
+
+impl HelpEmit {
+    fn into_tokens(self) -> TokenStream2 {
+        match self {
+            HelpEmit::Static(s) => quote! {
+                ::bareminal_cli::process::HelpSegment::Static(#s)
+            },
+            HelpEmit::OneOf { prefix, items_expr } => quote! {
+                ::bareminal_cli::process::HelpSegment::OneOf {
+                    prefix: #prefix,
+                    items: #items_expr,
+                }
+            },
+        }
+    }
+}
+
+fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<HelpEmit> {
     let mut lines = Vec::new();
     if let Some(d) = &set.default {
         let inner = unwrap_some_for_display(d);
@@ -503,7 +568,7 @@ fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
         s.push_str("[default: ");
         s.push_str(&display);
         s.push(']');
-        lines.push(s);
+        lines.push(HelpEmit::Static(s));
     }
     if let Some(mn) = &set.min {
         let pe = pretty_expr(mn);
@@ -512,7 +577,7 @@ fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
         s.push_str("[min: ");
         s.push_str(&pe);
         s.push(']');
-        lines.push(s);
+        lines.push(HelpEmit::Static(s));
     }
     if let Some(mx) = &set.max {
         let pe = pretty_expr(mx);
@@ -521,10 +586,24 @@ fn render_attr_summary(set: &SetAttrs, indent: &str) -> Vec<String> {
         s.push_str("[max: ");
         s.push_str(&pe);
         s.push(']');
-        lines.push(s);
+        lines.push(HelpEmit::Static(s));
     }
-    if let Some((_, elem_strs)) = &set.one_of {
-        lines.push(format!("{}[one of: {}]", indent, elem_strs.join(", ")));
+    if let Some((expr, kind)) = &set.one_of {
+        match kind {
+            OneOfKind::StaticLit { elem_strs } => {
+                lines.push(HelpEmit::Static(format!(
+                    "{}[one of: {}]",
+                    indent,
+                    elem_strs.join(", ")
+                )));
+            }
+            OneOfKind::Runtime => {
+                lines.push(HelpEmit::OneOf {
+                    prefix: format!("{}[one of: ", indent),
+                    items_expr: unwrap_groups(expr).clone(),
+                });
+            }
+        }
     }
     lines
 }
@@ -535,8 +614,8 @@ const FLAG_COLUMN: usize = 22;
 const FLAG_INDENT: &str = "                      ";
 
 /// Build help lines for a field, given its pre-parsed `SetAttrs`.
-fn build_field_help_lines(field: &syn::Field, set: &SetAttrs) -> Vec<String> {
-    let mut lines = Vec::new();
+fn build_field_help_lines(field: &syn::Field, set: &SetAttrs) -> Vec<HelpEmit> {
+    let mut lines: Vec<HelpEmit> = Vec::new();
 
     let field_ident = field.ident.as_ref().unwrap();
     let field_name = field_ident.to_string();
@@ -573,20 +652,20 @@ fn build_field_help_lines(field: &syn::Field, set: &SetAttrs) -> Vec<String> {
         head.push(' ');
     }
     head.push_str(first_doc);
-    lines.push(head);
+    lines.push(HelpEmit::Static(head));
 
     for line in doc.iter().skip(1) {
         let mut s = String::with_capacity(FLAG_INDENT.len() + line.len());
         s.push_str(FLAG_INDENT);
         s.push_str(line);
-        lines.push(s);
+        lines.push(HelpEmit::Static(s));
     }
 
     if optional && set.default.is_none() {
         let mut s = String::with_capacity(FLAG_INDENT.len() + 10);
         s.push_str(FLAG_INDENT);
         s.push_str("[optional]");
-        lines.push(s);
+        lines.push(HelpEmit::Static(s));
     }
 
     lines.extend(render_attr_summary(set, FLAG_INDENT));
@@ -611,31 +690,31 @@ fn usage_placeholder(ty: &Type) -> String {
     format!("<{}>", pretty_type_bare(ty))
 }
 
-fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<String> {
-    let mut lines = Vec::new();
+fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<HelpEmit> {
+    let mut lines: Vec<HelpEmit> = Vec::new();
 
     // Section header.
-    lines.push(format!("== {} ==", variant_str));
+    lines.push(HelpEmit::Static(format!("== {} ==", variant_str)));
 
     // Doc comment lines.
     let doc = extract_doc(&v.attrs);
-    lines.extend(doc.iter().cloned());
+    lines.extend(doc.iter().cloned().map(HelpEmit::Static));
 
     let set = parse_set_attrs(&v.attrs).ok().unwrap_or_default();
 
     // Usage line.
     match &v.fields {
         Fields::Unit => {
-            lines.push(variant_str.to_string());
+            lines.push(HelpEmit::Static(variant_str.to_string()));
         }
         Fields::Unnamed(unnamed) if unnamed.unnamed.len() == 1 => {
             let ty = &unnamed.unnamed[0].ty;
             let usage = usage_placeholder(ty);
-            lines.push(format!("{} {}", variant_str, usage));
+            lines.push(HelpEmit::Static(format!("{} {}", variant_str, usage)));
 
             let optional = unwrap_option(ty).is_some();
             if optional && set.default.is_none() {
-                lines.push("  [optional]".to_string());
+                lines.push(HelpEmit::Static("  [optional]".to_string()));
             }
             lines.extend(render_attr_summary(&set, "  "));
         }
@@ -659,15 +738,19 @@ fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<String> 
                 usage_parts.push(part);
             }
             if usage_parts.is_empty() {
-                lines.push(variant_str.to_string());
+                lines.push(HelpEmit::Static(variant_str.to_string()));
             } else {
-                lines.push(format!("{} {}", variant_str, usage_parts.join(" ")));
+                lines.push(HelpEmit::Static(format!(
+                    "{} {}",
+                    variant_str,
+                    usage_parts.join(" ")
+                )));
             }
 
             lines.extend(render_attr_summary(&set, "  "));
             if !named.named.is_empty() {
-                lines.push(String::new());
-                lines.push("Flags:".to_string());
+                lines.push(HelpEmit::Static(String::new()));
+                lines.push(HelpEmit::Static("Flags:".to_string()));
                 for field in &named.named {
                     let field_set = parse_set_attrs(&field.attrs).ok().unwrap_or_default();
                     lines.extend(build_field_help_lines(field, &field_set));
@@ -683,12 +766,12 @@ fn build_command_help_lines(v: &syn::Variant, variant_str: &str) -> Vec<String> 
 fn build_top_level_help_lines(
     general_doc: &[String],
     variants: &[(String, Vec<String>)],
-) -> Vec<String> {
-    let mut lines: Vec<String> = general_doc.to_vec();
+) -> Vec<HelpEmit> {
+    let mut lines: Vec<HelpEmit> = general_doc.iter().cloned().map(HelpEmit::Static).collect();
     if !general_doc.is_empty() {
-        lines.push(String::new());
+        lines.push(HelpEmit::Static(String::new()));
     }
-    lines.push("Commands:".to_string());
+    lines.push(HelpEmit::Static("Commands:".to_string()));
 
     let max_name = variants.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
     // Invariant: each name.len() <= max_name, so col - name.len() >= 4.
@@ -704,7 +787,7 @@ fn build_top_level_help_lines(
             s.push(' ');
         }
         s.push_str(summary);
-        lines.push(s);
+        lines.push(HelpEmit::Static(s));
     }
 
     lines
@@ -1170,17 +1253,23 @@ pub fn derive(input: TokenStream) -> TokenStream {
         .iter()
         .map(|v| (v.ident.to_string().to_kebab_case(), extract_doc(&v.attrs)))
         .collect();
-    let top_level_lines = build_top_level_help_lines(&general_doc, &variant_summaries);
+    let top_level_segments: Vec<TokenStream2> = build_top_level_help_lines(&general_doc, &variant_summaries)
+        .into_iter()
+        .map(HelpEmit::into_tokens)
+        .collect();
 
     let help_consts: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .map(|v| {
             let variant_str = v.ident.to_string().to_kebab_case();
-            let lines = build_command_help_lines(v, &variant_str);
+            let segments: Vec<TokenStream2> = build_command_help_lines(v, &variant_str)
+                .into_iter()
+                .map(HelpEmit::into_tokens)
+                .collect();
             let const_name = quote::format_ident!("__HELP_{}", v.ident.to_string().to_uppercase());
             quote! {
-                const #const_name: &[&str] = &[#(#lines),*];
+                const #const_name: &[::bareminal_cli::process::HelpSegment] = &[#(#segments),*];
             }
         })
         .collect();
@@ -1202,7 +1291,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
     let output = quote! {
         impl #impl_generics #name #ty_generics #where_clause {
-            pub const HELP_LINES: &'static [&'static str] = &[#(#top_level_lines),*];
+            pub const HELP_LINES: &'static [::bareminal_cli::process::HelpSegment] =
+                &[#(#top_level_segments),*];
         }
 
         impl #impl_generics ::bareminal_cli::process::CommandsParser for #name #ty_generics #where_clause {
@@ -1222,11 +1312,11 @@ pub fn derive(input: TokenStream) -> TokenStream {
                 }
             }
 
-            fn help() -> &'static [&'static str] {
+            fn help() -> &'static [::bareminal_cli::process::HelpSegment] {
                 Self::HELP_LINES
             }
 
-            fn help_for(name: &str) -> &'static [&'static str] {
+            fn help_for(name: &str) -> &'static [::bareminal_cli::process::HelpSegment] {
                 #(#help_consts)*
 
                 match name {
@@ -1351,11 +1441,11 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
 
     let general_doc = extract_doc(&ast.attrs);
 
-    let mut top_lines: Vec<String> = general_doc.to_vec();
+    let mut top_lines: Vec<HelpEmit> = general_doc.iter().cloned().map(HelpEmit::Static).collect();
     if !general_doc.is_empty() {
-        top_lines.push(String::new());
+        top_lines.push(HelpEmit::Static(String::new()));
     }
-    top_lines.push("Command groups:".to_string());
+    top_lines.push(HelpEmit::Static("Command groups:".to_string()));
     for v in &data_enum.variants {
         if let Fields::Unnamed(unnamed) = &v.fields
             && unnamed.unnamed.len() == 1
@@ -1363,9 +1453,14 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
             let variant_str = v.ident.to_string().to_kebab_case();
             let inner_ty = &unnamed.unnamed[0].ty;
             let ty_str = pretty_type_bare(inner_ty);
-            top_lines.push(format!("  {} (group: {})", variant_str, ty_str));
+            top_lines.push(HelpEmit::Static(format!(
+                "  {} (group: {})",
+                variant_str, ty_str
+            )));
         }
     }
+    let top_segments: Vec<TokenStream2> =
+        top_lines.into_iter().map(HelpEmit::into_tokens).collect();
 
     let has_lifetimes = ast.generics.lifetimes().next().is_some();
 
@@ -1397,7 +1492,8 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
 
     let output = quote! {
         impl #impl_generics #name #ty_generics #where_clause {
-            pub const HELP_LINES: &'static [&'static str] = &[#(#top_lines),*];
+            pub const HELP_LINES: &'static [::bareminal_cli::process::HelpSegment] =
+                &[#(#top_segments),*];
         }
 
         impl #impl_generics ::bareminal_cli::process::CommandsParser for #name #ty_generics #where_clause {
@@ -1413,17 +1509,17 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
                 Err(first_real_error.unwrap_or(::bareminal_cli::process::ProcessError::Unknown))
             }
 
-            fn help() -> &'static [&'static str] {
+            fn help() -> &'static [::bareminal_cli::process::HelpSegment] {
                 Self::HELP_LINES
             }
 
-            fn help_for(name: &str) -> &'static [&'static str] {
+            fn help_for(name: &str) -> &'static [::bareminal_cli::process::HelpSegment] {
                 #(#help_for_delegates)*
                 &[]
             }
 
             fn help_lines() -> ::bareminal_cli::process::HelpIter {
-                static __SECTIONS: &[(&str, &[&str])] = &[
+                static __SECTIONS: &[(&str, &[::bareminal_cli::process::HelpSegment])] = &[
                     #(#section_entries)*
                 ];
                 ::bareminal_cli::process::HelpIter::multi(__SECTIONS)

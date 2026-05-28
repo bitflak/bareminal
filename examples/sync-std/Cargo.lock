@@ -10,7 +10,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "bareminal_cli"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "heapless 0.9.3",
  "serde",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "bareminal_macros"
-version = "0.1.0"
+version = "0.3.2"
 dependencies = [
  "bareminal_cli",
  "heapless 0.9.3",
