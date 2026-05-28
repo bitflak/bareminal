@@ -481,10 +481,11 @@ where
 
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), RuntimeError> {
         self.writer.write(buf).await?;
+        self.redraw_prompt().await?;
         self.writer.flush().await
     }
 
-    pub async fn writer(&mut self) -> &mut W {
+    pub fn writer(&mut self) -> &mut W {
         &mut self.writer.writer
     }
 }
