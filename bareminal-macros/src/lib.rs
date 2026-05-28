@@ -923,6 +923,10 @@ fn struct_variant_arm(
 ) -> TokenStream2 {
     let mut bindings = Vec::with_capacity(fields.named.len());
     let mut flag_arms = Vec::with_capacity(fields.named.len());
+    // One arm per positional-eligible field, wrapped as `if #ident.is_none() { ... } else`.
+    // Joined in declaration order and terminated with `{ break; }` so surplus
+    // tokens fall through to the next chained command.
+    let mut positional_arms: Vec<TokenStream2> = Vec::with_capacity(fields.named.len());
     let mut field_inits = Vec::with_capacity(fields.named.len());
     let mut errors: Vec<syn::Error> = Vec::new();
     // Linear-scan vec is faster than HashMap for small N.
@@ -980,6 +984,10 @@ fn struct_variant_arm(
             let inner_ctx = TypeCtx::new(inner);
 
             if is_bool(inner) {
+                // Bool flag: presence sets `true`. We only consume the next
+                // token as a value if it is literally `true` or `false` —
+                // anything else stays in the stream so positional parsing
+                // can pick it up.
                 let parse = parse_element_value_expr(&inner_ctx, &context_str);
                 let range = range_check(&parsed_ident, min, max, &inner_ctx, &context_str);
                 let (_pre, post_check) =
@@ -987,11 +995,7 @@ fn struct_variant_arm(
                 flag_arms.push(quote! {
                     #flag_pattern => {
                         match tokens.peek() {
-                            None => { #field_ident = Some(true); }
-                            Some(next) if next.starts_with('-') => {
-                                #field_ident = Some(true);
-                            }
-                            Some(_) => {
+                            Some("true") | Some("false") => {
                                 let value = tokens.next().unwrap();
                                 match #parse {
                                     Ok(parsed) => {
@@ -1002,9 +1006,11 @@ fn struct_variant_arm(
                                     Err(e) => return Err(e),
                                 }
                             }
+                            _ => { #field_ident = Some(true); }
                         }
                     }
                 });
+                // Option<bool> is presence-only — no positional arm.
             } else {
                 let (pre_check, post_check) =
                     one_of_checks(&parsed_ident, one_of, &inner_ctx, &context_str);
@@ -1021,6 +1027,18 @@ fn struct_variant_arm(
                             Err(e) => return Err(e),
                         }
                     }
+                });
+                positional_arms.push(quote! {
+                    if #field_ident.is_none() {
+                        match #parse {
+                            Ok(parsed) => {
+                                #range
+                                #post_check
+                                #field_ident = Some(parsed);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else
                 });
             }
 
@@ -1056,6 +1074,18 @@ fn struct_variant_arm(
                         Err(e) => return Err(e),
                     }
                 }
+            });
+            positional_arms.push(quote! {
+                if #field_ident.is_none() {
+                    match #parse {
+                        Ok(parsed) => {
+                            #range
+                            #post_check
+                            #field_ident = Some(parsed);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else
             });
 
             let final_expr = if let Some(default_expr) = default {
@@ -1094,21 +1124,41 @@ fn struct_variant_arm(
         .map(|f| f.ident.as_ref().unwrap())
         .collect();
 
+    // Positional dispatch: chained `if .is_none() { ... } else` for each
+    // positional-eligible field, terminating with `{ break; }` so surplus
+    // positional tokens stay in the stream for the next chained command.
+    let positional_dispatch = if positional_arms.is_empty() {
+        quote! { break; }
+    } else {
+        quote! { #(#positional_arms)* { break; } }
+    };
+
     quote! {
         #variant_str => {
             #(#bindings)*
-            while let Some(flag) = tokens.peek() {
-                if !flag.starts_with('-') {
-                    break;
-                }
-                if flag == "--" {
+            loop {
+                let Some(__t) = tokens.peek() else { break; };
+                if __t == "--" {
                     tokens.next();
                     break;
                 }
-                let flag = tokens.next().unwrap();
-                match flag {
-                    #(#flag_arms)*
-                    _ => return Err(::bareminal_cli::process::ProcessError::UnknownFlag(flag)),
+                // A flag is a token of the form `-x...` where the char after
+                // the leading dash is neither a digit nor a `.` — that rules
+                // out negative numbers and `-.5`-style positional values.
+                let __is_flag = {
+                    let b = __t.as_bytes();
+                    b.len() >= 2
+                        && b[0] == b'-'
+                        && !matches!(b[1], b'0'..=b'9' | b'.')
+                };
+                if __is_flag {
+                    let flag = tokens.next().unwrap();
+                    match flag {
+                        #(#flag_arms)*
+                        _ => return Err(::bareminal_cli::process::ProcessError::UnknownFlag(flag)),
+                    }
+                } else {
+                    #positional_dispatch
                 }
             }
             Ok(Self::Match::#variant_ident {

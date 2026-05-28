@@ -7,4 +7,5 @@ fn tests() {
     t.pass("tests/04-parse-attributes.rs");
     t.pass("tests/05-parse-flags.rs");
     t.pass("tests/06-parse-one-of-runtime.rs");
+    t.pass("tests/07-parse-positional.rs");
 }
