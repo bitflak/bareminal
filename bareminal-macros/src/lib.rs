@@ -1042,10 +1042,13 @@ fn struct_variant_arm(
                 });
             }
 
+            // Emitted as `name: expr`, except when the initializer is the
+            // binding of the same name — then shorthand, so the generated
+            // code does not trip `clippy::redundant_field_names`.
             let final_expr = if let Some(default_expr) = default {
                 let default_value = default_value_expr(default_expr, &field_ctx);
                 quote! {
-                    match #field_ident {
+                    #field_ident: match #field_ident {
                         Some(_) => #field_ident,
                         None => #default_value,
                     }
@@ -1091,14 +1094,14 @@ fn struct_variant_arm(
             let final_expr = if let Some(default_expr) = default {
                 let default_value = default_value_expr(default_expr, &field_ctx);
                 quote! {
-                    match #field_ident {
+                    #field_ident: match #field_ident {
                         Some(v) => v,
                         None => #default_value,
                     }
                 }
             } else {
                 quote! {
-                    #field_ident.ok_or(
+                    #field_ident: #field_ident.ok_or(
                         ::bareminal_cli::process::ProcessError::MissingFlag(#long_flag)
                     )?
                 }
@@ -1117,12 +1120,6 @@ fn struct_variant_arm(
             .unwrap();
         return combined.to_compile_error();
     }
-
-    let field_names: Vec<_> = fields
-        .named
-        .iter()
-        .map(|f| f.ident.as_ref().unwrap())
-        .collect();
 
     // Positional dispatch: chained `if .is_none() { ... } else` for each
     // positional-eligible field, terminating with `{ break; }` so surplus
@@ -1162,7 +1159,7 @@ fn struct_variant_arm(
                 }
             }
             Ok(Self::Match::#variant_ident {
-                #(#field_names: #field_inits),*
+                #(#field_inits),*
             })
         },
     }
