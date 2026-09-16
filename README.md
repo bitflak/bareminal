@@ -31,20 +31,20 @@ Dual-licensed under [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
 Add bareminal dependency:
 
 ```toml
-bareminal_macros = { version = "0.1" }
+bareminal_macros = { version = "0.3" }
 
-bareminal_cli = { version = "0.1", default-features = false, features = [
+bareminal_cli = { version = "0.3", default-features = false, features = [
   "async-no-std",
 ] }
 
 // or
-bareminal_cli = { version = "0.1", default-features = false, features = [
+bareminal_cli = { version = "0.3", default-features = false, features = [
   "async-std",
 ] }
 
 
 // or
-bareminal_cli = { version = "0.1", default-features = false, features = [
+bareminal_cli = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 ```
