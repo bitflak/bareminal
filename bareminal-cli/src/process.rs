@@ -165,6 +165,59 @@ impl HelpIter {
     }
 }
 
+/// A node in a command group's help tree. `Section` is a leaf holding one
+/// command's help lines; `Group` is a branch whose members are expanded
+/// inline, so nested command groups contribute their members' sections at
+/// the parent's level.
+#[derive(Debug, Clone, Copy)]
+pub enum HelpTree {
+    Section {
+        header: &'static str,
+        segments: &'static [HelpSegment],
+    },
+    Group(&'static [HelpTree]),
+}
+
+/// Number of leaf sections in a help tree, counting nested groups.
+pub const fn help_tree_len(tree: &HelpTree) -> usize {
+    match tree {
+        HelpTree::Section { .. } => 1,
+        HelpTree::Group(members) => {
+            let mut total = 0;
+            let mut i = 0;
+            while i < members.len() {
+                total += help_tree_len(&members[i]);
+                i += 1;
+            }
+            total
+        }
+    }
+}
+
+/// Flatten a help tree into `out` starting at `idx`, returning the next free
+/// index. Nested groups are expanded so all leaf sections appear in order.
+pub const fn flatten_help_tree(
+    tree: &HelpTree,
+    out: &mut [(&'static str, &'static [HelpSegment])],
+    idx: usize,
+) -> usize {
+    match tree {
+        HelpTree::Section { header, segments } => {
+            out[idx] = (header, segments);
+            idx + 1
+        }
+        HelpTree::Group(members) => {
+            let mut i = 0;
+            let mut idx = idx;
+            while i < members.len() {
+                idx = flatten_help_tree(&members[i], out, idx);
+                i += 1;
+            }
+            idx
+        }
+    }
+}
+
 fn segment_to_line(seg: &HelpSegment) -> HelpLine {
     match seg {
         HelpSegment::Static(s) => HelpLine::Static(s),
