@@ -1336,10 +1336,18 @@ pub fn derive(input: TokenStream) -> TokenStream {
         .map(|(name, _)| name.clone())
         .collect();
 
+    let command_header = format!("== {} ==", name);
+
     let output = quote! {
         impl #impl_generics #name #ty_generics #where_clause {
             pub const HELP_LINES: &'static [::bareminal_cli::process::HelpSegment] =
                 &[#(#top_level_segments),*];
+
+            pub const HELP_TREE: ::bareminal_cli::process::HelpTree =
+                ::bareminal_cli::process::HelpTree::Section {
+                    header: #command_header,
+                    segments: Self::HELP_LINES,
+                };
         }
 
         impl #impl_generics ::bareminal_cli::process::CommandsParser for #name #ty_generics #where_clause {
@@ -1469,17 +1477,17 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Build group sections: (header, member_HELP_LINES) pairs.
-    let section_entries: Vec<TokenStream2> = data_enum
+    // Build the help tree: command members become leaf sections, nested
+    // command groups become branches whose members are flattened inline.
+    let tree_members: Vec<TokenStream2> = data_enum
         .variants
         .iter()
         .filter_map(|v| match &v.fields {
             Fields::Unnamed(unnamed) if unnamed.unnamed.len() == 1 => {
                 let inner_ty = &unnamed.unnamed[0].ty;
                 let inner_ty_static = rewrite_lifetimes(inner_ty, "'static");
-                let header = format!("== {} ==", pretty_type_bare(inner_ty));
                 Some(quote! {
-                    (#header, <#inner_ty_static>::HELP_LINES),
+                    <#inner_ty_static>::HELP_TREE,
                 })
             }
             _ => None,
@@ -1511,6 +1519,14 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
 
     let has_lifetimes = ast.generics.lifetimes().next().is_some();
 
+    let lifetime_count = ast.generics.lifetimes().count();
+    let group_static_ty = if lifetime_count > 0 {
+        let statics = std::iter::repeat(quote! { 'static }).take(lifetime_count);
+        quote! { #name< #(#statics),* > }
+    } else {
+        quote! { #name }
+    };
+
     let match_ty = if has_lifetimes {
         quote! { #name<'mch> }
     } else {
@@ -1541,6 +1557,9 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
         impl #impl_generics #name #ty_generics #where_clause {
             pub const HELP_LINES: &'static [::bareminal_cli::process::HelpSegment] =
                 &[#(#top_segments),*];
+
+            pub const HELP_TREE: ::bareminal_cli::process::HelpTree =
+                ::bareminal_cli::process::HelpTree::Group(&[#(#tree_members)*]);
         }
 
         impl #impl_generics ::bareminal_cli::process::CommandsParser for #name #ty_generics #where_clause {
@@ -1566,10 +1585,19 @@ pub fn derive_command_group(input: TokenStream) -> TokenStream {
             }
 
             fn help_lines() -> ::bareminal_cli::process::HelpIter {
-                static __SECTIONS: &[(&str, &[::bareminal_cli::process::HelpSegment])] = &[
-                    #(#section_entries)*
-                ];
-                ::bareminal_cli::process::HelpIter::multi(__SECTIONS)
+                const __N: usize =
+                    ::bareminal_cli::process::help_tree_len(&<#group_static_ty>::HELP_TREE);
+                static __SECTIONS: [(&str, &[::bareminal_cli::process::HelpSegment]); __N] = {
+                    let mut __arr: [(&str, &[::bareminal_cli::process::HelpSegment]); __N] =
+                        [("", &[] as &[::bareminal_cli::process::HelpSegment]); __N];
+                    ::bareminal_cli::process::flatten_help_tree(
+                        &<#group_static_ty>::HELP_TREE,
+                        &mut __arr,
+                        0,
+                    );
+                    __arr
+                };
+                ::bareminal_cli::process::HelpIter::multi(&__SECTIONS)
             }
 
             fn autocomplete(name: &str) -> ::core::option::Option<&'static str> {
